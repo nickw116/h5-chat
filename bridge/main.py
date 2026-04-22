@@ -246,7 +246,7 @@ async def _publish_gateway_event(session_key: str, run_id: str, stream: str, pay
         event = {**base, "kind": f"run.{phase}" if phase else "lifecycle", "payload": {"phase": phase}}
         if phase == "end":
             # After lifecycle end, pull full text from history and publish full_result
-            asyncio.create_task(_publish_full_result_from_history(session_key, run_id, client))
+            asyncio.create_task(_publish_full_result_from_history(session_key, run_id))
     elif stream == "plan":
         event = {**base, "kind": "plan", "payload": {"text": data.get("text", "") or data.get("summary", "")}}
     elif stream == "model":
@@ -446,15 +446,81 @@ class ChangePasswordReq(BaseModel):
 
 # ── Routes ──────────────────────────────────────────────────────
 
+async def _build_session_snapshot(session_key: str) -> dict:
+    """Build a snapshot of the current session state for reconnection recovery."""
+    snapshot = {
+        "sessionKey": session_key,
+        "ts": int(time.time() * 1000),
+        "activeRuns": {},
+    }
+
+    # Check if there's an active run for this session
+    active_run_id = _agent_session_to_run.get(session_key)
+    if active_run_id:
+        cache = _run_cache.get(active_run_id)
+        if cache:
+            # Extract main text from cached events
+            main_text = ""
+            acp_text = ""
+            steps = []
+            for ev in cache.get("events", []):
+                stream = ev.get("stream", "")
+                data = ev.get("data", {})
+                if stream == "assistant":
+                    delta = data.get("delta", "")
+                    if delta:
+                        if ev.get("_is_child"):
+                            acp_text += delta
+                        else:
+                            main_text += delta
+                elif stream == "item":
+                    phase = data.get("phase", "")
+                    name = data.get("name", "")
+                    summary = data.get("summary", "") or data.get("title", "")
+                    if name and phase in ("start", "end"):
+                        steps.append({"name": name, "phase": phase, "summary": summary})
+
+            snapshot["activeRuns"][active_run_id] = {
+                "status": cache.get("status", "streaming"),
+                "mainText": main_text,
+                "acpText": acp_text,
+                "steps": steps[-20:],  # last 20 steps
+                "createdAt": cache.get("created_at", 0),
+            }
+    else:
+        # No active run — check if there's a recent run in cache
+        for rid, psk in list(_run_to_parent_session.items()):
+            if psk == session_key:
+                cache = _run_cache.get(rid)
+                if cache:
+                    main_text = ""
+                    for ev in cache.get("events", []):
+                        if ev.get("stream") == "assistant" and not ev.get("_is_child"):
+                            main_text += ev.get("data", {}).get("delta", "")
+                    if main_text.strip() and main_text.strip() not in _FILTERED_STREAM_TEXTS:
+                        snapshot["lastRunId"] = rid
+                        snapshot["lastRunText"] = main_text
+                        snapshot["lastRunStatus"] = cache.get("status", "done")
+                    break
+
+    # Also try to get runtime model
+    cached_model = _session_runtime_model.get(session_key, "")
+    if cached_model:
+        snapshot["model"] = cached_model
+
+    return snapshot
+
+
 @app.get("/api/events")
 async def event_stream(
     sessionKey: str = Query(None),
     clientId: str = Query(None),
     user=Depends(get_current_user),
 ):
-    """Persistent SSE event stream (Phase 1 — observation mode).
+    """Persistent SSE event stream.
 
     H5 establishes this connection after login and keeps it alive.
+    On connect, sends a snapshot of the current session state.
     All Gateway agent events for the given sessionKey are pushed here.
     """
     if not sessionKey:
@@ -468,15 +534,23 @@ async def event_stream(
 
     async def generate():
         try:
-            # Send initial ping so the client knows the connection is alive
-            yield f"event: ping\ndata: {{\"ts\": {int(time.time() * 1000)}, \"subscriber\": \"{subscriber_id[:8]}\", \"session\": \"{sessionKey[:40]}\"}}\n\n"
-            logger.info("Event stream opened: sessionKey=%s subscriber=%s", sessionKey[:30], subscriber_id[:8])
+            # Send snapshot of current session state
+            snapshot = await _build_session_snapshot(sessionKey)
+            snap_event = {
+                "eventId": f"evt-snap-{uuid.uuid4().hex[:12]}",
+                "sessionKey": sessionKey,
+                "kind": "snapshot",
+                "ts": int(time.time() * 1000),
+                "payload": snapshot,
+            }
+            yield f"data: {json.dumps(snap_event, ensure_ascii=False)}\n\n"
+            logger.info("Event stream opened: sessionKey=%s subscriber=%s snapshot_runs=%d", sessionKey[:30], subscriber_id[:8], len(snapshot.get("activeRuns", {})))
+
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=_EVENT_STREAM_HEARTBEAT_SEC)
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    # Heartbeat
                     yield f"event: ping\ndata: {{\"ts\": {int(time.time() * 1000)}}}\n\n"
         except asyncio.CancelledError:
             logger.info("Event stream cancelled: sessionKey=%s subscriber=%s", sessionKey[:30], subscriber_id[:8])
@@ -755,8 +829,8 @@ async def history(
     return res["payload"]
 
 
-@app.post("/api/chat")
-async def chat_send(req: ChatReq, user=Depends(get_current_user)):
+@app.post("/api/chat/legacy")
+async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
     client = await get_client()
     # Use client-provided session_key, or fall back to server active session
     agent_id = _agent_id(user['role'])
@@ -1221,8 +1295,9 @@ async def chat_send(req: ChatReq, user=Depends(get_current_user)):
     )
 
 
+@app.post("/api/chat")
 @app.post("/api/chat/v2")
-async def chat_send_v2(req: ChatReq, user=Depends(get_current_user)):
+async def chat_send(req: ChatReq, user=Depends(get_current_user)):
     """Phase 2: JSON-only chat endpoint (no SSE response).
 
     Sends the message to Gateway, returns immediately with runId.
@@ -1253,7 +1328,7 @@ async def chat_send_v2(req: ChatReq, user=Depends(get_current_user)):
         raise HTTPException(500, json.dumps(send_res.get("error")))
 
     run_id = send_res.get("payload", {}).get("runId", "")
-    logger.info("chat_send_v2: runId=%s, sessionKey=%s", run_id[:12], session_key[:30])
+    logger.info("chat_send: runId=%s, sessionKey=%s", run_id[:12], session_key[:30])
 
     _cleanup_old_cache()
     _uploaded_files_cache.clear()
