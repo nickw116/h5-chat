@@ -38,6 +38,41 @@ _FILE_EXT_PATTERN = re.compile(
 _uploaded_files_cache: set[str] = set()
 _FILTERED_STREAM_TEXTS = {"NO_REPLY", "HEARTBEAT_OK"}
 
+_ACP_FORCE_PATTERNS = [
+    r'\b(?:acp|codex|claude code|cursor|copilot|gemini(?:\s+cli)?|qwen|kiro|kimi|opencode)\b',
+    r'用(?:acp|codex|claude code|cursor|copilot|gemini|qwen|kiro|kimi)',
+    r'交给(?:acp|codex|子代理|子 ?agent|编码代理)',
+    r'(?:走|开启|切到|进入)(?:acp|编码模式|子代理)',
+    r'直接用(?:acp|codex|子代理)',
+]
+
+_ACP_SOFT_PATTERNS = [
+    r'修(?:一下|复)?(?:这个|一下)?\s*(?:bug|问题|报错)',
+    r'重构',
+    r'改(?:一下|造)?代码',
+    r'看(?:一下)?(?:这个|项目|仓库|代码库)',
+    r'实现(?:一个|一下)?(?:功能|需求)',
+    r'新增(?:一个|一下)?(?:功能|接口|页面|组件)',
+    r'创建(?:文件|项目|页面|组件|脚本)',
+    r'写(?:一个|一下)?(?:脚本|函数|组件|页面|接口)',
+    r'帮我(?:修改|实现|开发|排查)',
+    r'排查(?:一下)?(?:代码|项目|问题)',
+]
+
+_ACP_NEGATIVE_PATTERNS = [
+    r'^/model\b',
+    r'^/new\b',
+    r'^/stop\b',
+    r'只是问问',
+    r'先别改',
+    r'不要改代码',
+    r'不用acp',
+    r'不要acp',
+    r'别用acp',
+    r'仅分析',
+    r'只读',
+]
+
 
 def _extract_file_paths(text: str) -> list[str]:
     """从文本中提取本地文件路径。"""
@@ -50,6 +85,59 @@ def _extract_file_paths(text: str) -> list[str]:
             _uploaded_files_cache.add(clean)
             result.append(clean)
     return result
+
+
+def _matches_any(text: str, patterns: list[str]) -> bool:
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+
+def _classify_acp_route(message: str) -> tuple[str, str]:
+    """Return (mode, reason): force|suggest|off."""
+    raw = (message or "").strip()
+    if not raw:
+        return ("off", "empty")
+
+    if _matches_any(raw, _ACP_NEGATIVE_PATTERNS):
+        return ("off", "negative")
+
+    if _matches_any(raw, _ACP_FORCE_PATTERNS):
+        return ("force", "explicit")
+
+    if _matches_any(raw, _ACP_SOFT_PATTERNS):
+        return ("suggest", "heuristic")
+
+    return ("off", "default")
+
+
+def _decorate_h5_message(message: str) -> tuple[str, str, str]:
+    """Attach H5 source tag + ACP routing hint for dual-layer control."""
+    raw = (message or "").strip()
+    mode, reason = _classify_acp_route(raw)
+
+    if raw.startswith("[H5]"):
+        base = raw
+    else:
+        base = f"[H5] {raw}"
+
+    if mode == "force":
+        hint = (
+            "\n\n[H5 ACP ROUTE]\n"
+            "mode=force\n"
+            "当用户消息涉及编码/项目修改时，优先使用 sessions_spawn 发起 ACP 子任务。"
+            "若只是纯问答或解释，再直接回答。"
+        )
+        return (f"{base}{hint}", mode, reason)
+
+    if mode == "suggest":
+        hint = (
+            "\n\n[H5 ACP ROUTE]\n"
+            "mode=suggest\n"
+            "这条消息疑似为复杂编码/项目任务。若需要查看文件、修改代码、运行命令、跨文件排查，优先使用 sessions_spawn；"
+            "若是小修或纯解释，可直接处理。"
+        )
+        return (f"{base}{hint}", mode, reason)
+
+    return (base, mode, reason)
 
 # ── 全局 agent 事件分发器 + 消息缓存 ──────────────────────────
 _agent_run_queues: dict[str, asyncio.Queue] = {}  # sessionKey → queue
@@ -842,8 +930,9 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
     # 确保全局 agent 监听器已注册
     _register_global_agent_listener(client)
 
-    # 给消息加 [H5] 前缀标识来源
-    tagged_message = f"[H5] {req.message}" if not req.message.startswith("[H5]") else req.message
+    # 给消息加 [H5] 来源标识，并按双层规则附加 ACP 路由提示
+    tagged_message, acp_mode, acp_reason = _decorate_h5_message(req.message)
+    logger.info("H5 ACP route: sessionKey=%s mode=%s reason=%s msg=%s", session_key[:30], acp_mode, acp_reason, req.message[:80])
 
     # 检测 /model 切换命令，更新运行时模型缓存
     model_match = re.match(r'^/model\s+(\S+)', req.message.strip())
@@ -1311,7 +1400,8 @@ async def chat_send(req: ChatReq, user=Depends(get_current_user)):
 
     _register_global_agent_listener(client)
 
-    tagged_message = f"[H5] {req.message}" if not req.message.startswith("[H5]") else req.message
+    tagged_message, acp_mode, acp_reason = _decorate_h5_message(req.message)
+    logger.info("H5 ACP route: sessionKey=%s mode=%s reason=%s msg=%s", session_key[:30], acp_mode, acp_reason, req.message[:80])
 
     # /model command → update runtime cache
     model_match = re.match(r'^/model\s+(\S+)', req.message.strip())
@@ -1348,7 +1438,7 @@ async def chat_send(req: ChatReq, user=Depends(get_current_user)):
         "source": "main",
         "ts": int(time.time() * 1000),
         "kind": "run.started",
-        "payload": {"message": req.message[:100]},
+        "payload": {"message": req.message[:100], "acpMode": acp_mode, "acpReason": acp_reason},
     })
 
     return {"ok": True, "runId": run_id, "sessionKey": session_key}
