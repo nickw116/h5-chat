@@ -5,3 +5,10 @@ __pycache__/
 
 venv/
 .env
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+credentials.*
+config.local.*
