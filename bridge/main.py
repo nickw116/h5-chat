@@ -1,6 +1,7 @@
 """FastAPI bridge: H5 frontend ↔ OpenClaw Gateway WebSocket RPC."""
 
 import asyncio
+import glob
 import json
 import os
 import re
@@ -9,7 +10,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header, Depends, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Header, Depends, Query, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -38,12 +39,31 @@ _FILE_EXT_PATTERN = re.compile(
 _uploaded_files_cache: set[str] = set()
 _FILTERED_STREAM_TEXTS = {"NO_REPLY", "HEARTBEAT_OK"}
 
+# H5 前端不显示主 agent (dev) 的工具调用卡片
+# 注意：仅对主 agent 生效；ACP 子 agent (subagent/acp 会话) 的同名工具不会被过滤
+_H5_FILTERED_MAIN_AGENT_TOOLS = frozenset({
+    "sessions_spawn",
+    "sessions_yield",
+    "sessions_list",
+    "subagents",
+    "subagents_list",
+    "subagents_kill",
+    "subagents_steer",
+    "session_status",
+    "memory_get",
+    "memory_search",
+    "read",
+    "write",
+    "edit",
+    "exec",
+})
+
 _ACP_FORCE_PATTERNS = [
-    r'\b(?:acp|codex|claude code|cursor|copilot|gemini(?:\s+cli)?|qwen|kiro|kimi|opencode)\b',
-    r'用(?:acp|codex|claude code|cursor|copilot|gemini|qwen|kiro|kimi)',
-    r'交给(?:acp|codex|子代理|子 ?agent|编码代理)',
+    r'\b(?:acp|claude code|cursor|copilot|gemini(?:\s+cli)?|qwen|kiro|kimi|opencode)\b',
+    r'用(?:acp|claude code|cursor|copilot|gemini|qwen|kiro|kimi)',
+    r'交给(?:acp|子代理|子 ?agent|编码代理)',
     r'(?:走|开启|切到|进入)(?:acp|编码模式|子代理)',
-    r'直接用(?:acp|codex|子代理)',
+    r'直接用(?:acp|子代理)',
 ]
 
 _ACP_SOFT_PATTERNS = [
@@ -145,7 +165,9 @@ _session_event_subscribers: dict[str, dict[str, asyncio.Queue]] = {}  # sessionK
 _agent_session_to_run: dict[str, str] = {}  # sessionKey → chat.send runId (for lifecycle end matching)
 _run_to_parent_session: dict[str, str] = {}  # runId → parent sessionKey
 _child_to_parent: dict[str, str] = {}  # child sessionKey → parent sessionKey (spawn 时注册)
+_acp_run_cwd: dict[str, str] = {}  # runId → cwd (for claude:acp runs, to find CC project log)
 _agent_listener_registered = False
+_active_acp_runs: dict[str, dict] = {}  # runId -> {runId, status, started_at}
 _EVENT_STREAM_HEARTBEAT_SEC = 15
 
 # 运行时模型缓存：sessionKey → model（由 /model 命令或 SSE agent 事件更新）
@@ -216,6 +238,28 @@ def _cleanup_old_cache():
     if expired_parent_keys:
         logger.info("Cleaned up %d expired child event cache entries", len(expired_parent_keys))
 
+    # 清理无活动的 _active_acp_runs（超过10分钟无事件且仍在 running 的残留）
+    expired_acp = [
+        rid for rid, info in list(_active_acp_runs.items())
+        if info.get("status") == "running" and now - info.get("last_event_at", info.get("started_at", 0)) > 600
+    ]
+    for rid in expired_acp:
+        _active_acp_runs[rid]["status"] = "timeout"
+    if expired_acp:
+        logger.warning("Marked %d inactive active acp runs as timeout", len(expired_acp))
+        _publish_acp_status()
+    # 移除已 timeout 的条目（给前端同步窗口后清理）
+    timed_out = [
+        rid for rid, info in list(_active_acp_runs.items())
+        if info.get("status") == "timeout"
+    ]
+    for rid in timed_out:
+        _active_acp_runs.pop(rid, None)
+        _acp_run_cwd.pop(rid, None)
+    if timed_out:
+        logger.info("Cleaned up %d timed-out acp runs", len(timed_out))
+        _publish_acp_status()
+
 
 def _register_session_subscriber(session_key: str, subscriber_id: str) -> asyncio.Queue:
     queue: asyncio.Queue = asyncio.Queue()
@@ -234,20 +278,59 @@ def _unregister_session_subscriber(session_key: str, subscriber_id: str):
     logger.info("Unregistered event subscriber: sessionKey=%s subscriber=%s remaining=%d", session_key[:30], subscriber_id[:8], len(_session_event_subscribers.get(session_key, {})))
 
 
+def _publish_acp_status():
+    """推送当前 ACP 状态到所有活跃的 event subscriber"""
+    runs = []
+    for rid, info in list(_active_acp_runs.items()):
+        run_data = {"runId": rid, "status": info.get("status", "running")}
+        steps = info.get("steps", [])
+        if steps:
+            run_data["steps"] = steps
+        runs.append(run_data)
+    event = {
+        "eventId": f"evt-acp-{uuid.uuid4().hex[:12]}",
+        "kind": "acp_status",
+        "ts": int(time.time() * 1000),
+        "payload": {"count": len(runs), "runs": runs}
+    }
+    # 推送到所有 session 的 subscriber
+    for sk, subs in list(_session_event_subscribers.items()):
+        for sid, queue in list(subs.items()):
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                pass
+
+
 async def _publish_session_event(session_key: str, event: dict):
     if not session_key:
         return
-    subscribers = _session_event_subscribers.get(session_key, {})
-    if not subscribers:
-        return
-    stale_ids = []
-    for subscriber_id, queue in list(subscribers.items()):
-        try:
-            queue.put_nowait(event)
-        except Exception:
-            stale_ids.append(subscriber_id)
-    for subscriber_id in stale_ids:
-        _unregister_session_subscriber(session_key, subscriber_id)
+    # Try both the full session key and the public (un-prefixed) key,
+    # because /api/events registers subscribers with bare keys while
+    # _publish_gateway_event may publish with agent-prefixed keys.
+    tried_keys = set()
+    for candidate_key in (session_key,):
+        if candidate_key in tried_keys:
+            continue
+        tried_keys.add(candidate_key)
+        # also add the public key (strip agent:xxx: prefix)
+        if candidate_key.startswith("agent:"):
+            parts = candidate_key.split(":", 2)
+            if len(parts) == 3 and parts[2]:
+                tried_keys.add(parts[2])
+
+    for sk in tried_keys:
+        subscribers = _session_event_subscribers.get(sk, {})
+        if not subscribers:
+            continue
+        stale_ids = []
+        for subscriber_id, queue in list(subscribers.items()):
+            try:
+                queue.put_nowait(event)
+            except Exception:
+                stale_ids.append(subscriber_id)
+        for subscriber_id in stale_ids:
+            _unregister_session_subscriber(sk, subscriber_id)
 
 
 def _child_event_fields(payload: dict) -> dict:
@@ -268,40 +351,61 @@ async def _publish_full_result_from_history(session_key: str, run_id: str, clien
         await asyncio.sleep(1.5)
         if client is None:
             client = await get_client()
-        hist = await client.rpc("session.history", {
+
+        # Build candidate session keys for Gateway RPC.
+        # Gateway session.history requires agent-prefixed keys.
+        session_keys_to_try = [session_key]
+        if session_key.startswith("agent:"):
+            pass  # already prefixed
+        else:
+            for agent_id in ("dev", "user", "main"):
+                session_keys_to_try.append(f"agent:{agent_id}:{session_key}")
+
+        full_text = ""
+        for sk in session_keys_to_try:
+            try:
+                hist = await client.rpc("session.history", {
+                    "sessionKey": sk,
+                    "limit": 5,
+                })
+                messages = hist.get("messages", [])
+                for msg in reversed(messages):
+                    if msg.get("role") == "assistant":
+                        text = msg.get("content", "")
+                        if text and isinstance(text, str) and text.strip() not in _FILTERED_STREAM_TEXTS:
+                            full_text = text
+                        break
+                if full_text:
+                    break
+            except Exception:
+                continue
+
+        if not full_text:
+            logger.info("_publish_full_result_from_history: no assistant text found for session=%s run=%s", session_key[:30], run_id[:12])
+            return
+
+        await _publish_session_event(session_key, {
+            "eventId": f"evt-{uuid.uuid4().hex[:16]}",
             "sessionKey": session_key,
-            "limit": 5,
+            "runId": run_id,
+            "source": "main",
+            "ts": int(time.time() * 1000),
+            "kind": "full_result",
+            "payload": {"text": full_text, "runId": run_id},
         })
-        messages = hist.get("messages", [])
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                full_text = msg.get("content", "")
-                if full_text and isinstance(full_text, str):
-                    if full_text.strip() in _FILTERED_STREAM_TEXTS:
-                        return
-                    await _publish_session_event(session_key, {
-                        "eventId": f"evt-{uuid.uuid4().hex[:16]}",
-                        "sessionKey": session_key,
-                        "runId": run_id,
-                        "source": "main",
-                        "ts": int(time.time() * 1000),
-                        "kind": "full_result",
-                        "payload": {"text": full_text},
-                    })
-                    await _publish_session_event(session_key, {
-                        "eventId": f"evt-{uuid.uuid4().hex[:16]}",
-                        "sessionKey": session_key,
-                        "runId": run_id,
-                        "source": "main",
-                        "ts": int(time.time() * 1000),
-                        "kind": "run.done",
-                        "payload": {},
-                    })
-                    # Update cache status
-                    cache = _run_cache.get(run_id)
-                    if cache:
-                        cache["status"] = "done"
-                return
+        await _publish_session_event(session_key, {
+            "eventId": f"evt-{uuid.uuid4().hex[:16]}",
+            "sessionKey": session_key,
+            "runId": run_id,
+            "source": "main",
+            "ts": int(time.time() * 1000),
+            "kind": "run.done",
+            "payload": {},
+        })
+        # Update cache status
+        cache = _run_cache.get(run_id)
+        if cache:
+            cache["status"] = "done"
     except Exception as e:
         logger.warning("_publish_full_result_from_history failed: %s", e)
 
@@ -332,6 +436,13 @@ async def _publish_gateway_event(session_key: str, run_id: str, stream: str, pay
     elif stream == "lifecycle":
         phase = data.get("phase", "")
         event = {**base, "kind": f"run.{phase}" if phase else "lifecycle", "payload": {"phase": phase}}
+        if phase == "error":
+            error_text = data.get("error", "")
+            if error_text:
+                event["payload"]["error"] = error_text
+                # Also publish a standalone run_error event for persistent subscribers
+                run_error_event = {**base, "kind": "run_error", "payload": {"error": error_text, "phase": phase}}
+                await _publish_session_event(session_key, run_error_event)
         if phase == "end":
             # After lifecycle end, pull full text from history and publish full_result
             asyncio.create_task(_publish_full_result_from_history(session_key, run_id))
@@ -345,6 +456,415 @@ async def _publish_gateway_event(session_key: str, run_id: str, stream: str, pay
     await _publish_session_event(session_key, event)
 
 
+def _cwd_to_project_dir(cwd: str) -> str:
+    """Convert a cwd path to Claude Code project_dir format.
+    project_dir = cwd with leading / removed and remaining / replaced by -"""
+    if not cwd:
+        return ""
+    return cwd.replace("/", "-")
+
+
+def _read_claude_project_log(session_key: str, run_id: str) -> list[dict]:
+    """Read Claude Code project log and parse into structured event list.
+
+    Returns list of dicts with keys: type (tool_use|tool_result|thinking), name, content, session_id
+    """
+    logger.info("_read_claude_project_log: ENTER session=%s run=%s", session_key[:20], run_id[:12])
+    events = []
+    # Try to find cwd from _acp_run_cwd first
+    cwd = _acp_run_cwd.get(run_id, "")
+    if not cwd:
+        # Fallback: try to derive from session_key (for spawned subagent sessions)
+        # session_key format: agent:dev:subagent:{uuid} or agent:dev:h5-admin-...
+        pass
+
+    if not cwd:
+        # Final fallback: scan all CC project dirs for the latest jsonl
+        projects_base = os.path.expanduser("~/.claude/projects")
+        if os.path.isdir(projects_base):
+            latest_log = None
+            latest_mtime = 0
+            for pd in os.listdir(projects_base):
+                pd_path = os.path.join(projects_base, pd)
+                if not os.path.isdir(pd_path):
+                    continue
+                for f in glob.glob(os.path.join(pd_path, "*.jsonl")):
+                    mtime = os.path.getmtime(f)
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+                        latest_log = f
+            if latest_log:
+                project_base = os.path.dirname(latest_log)
+                logger.info("_read_claude_project_log: fallback scan found log=%s", latest_log)
+            else:
+                logger.info("_read_claude_project_log: no cwd and no CC project log found anywhere")
+                return events
+        else:
+            logger.info("_read_claude_project_log: no cwd and ~/.claude/projects not found")
+            return events
+    else:
+        project_dir = _cwd_to_project_dir(cwd)
+        project_base = os.path.expanduser(f"~/.claude/projects/{project_dir}")
+        if not os.path.isdir(project_base):
+            logger.info("_read_claude_project_log: project dir not found for cwd=%s, will fallback scan", cwd)
+            # Direct fallback: scan all project dirs for latest log
+            projects_base = os.path.expanduser("~/.claude/projects")
+            project_base = None
+            latest_mtime = 0
+            if os.path.isdir(projects_base):
+                for pd in os.listdir(projects_base):
+                    pd_path = os.path.join(projects_base, pd)
+                    if not os.path.isdir(pd_path):
+                        continue
+                    for f in glob.glob(os.path.join(pd_path, "*.jsonl")):
+                        mtime = os.path.getmtime(f)
+                        if mtime > latest_mtime:
+                            latest_mtime = mtime
+                            project_base = pd_path
+            if not project_base:
+                logger.info("_read_claude_project_log: fallback scan found no CC project dirs")
+                return events
+
+    # Find the most recently modified jsonl file (likely the current session)
+    jsonl_files = glob.glob(os.path.join(project_base, "*.jsonl"))
+    if not jsonl_files:
+        logger.info("_read_claude_project_log: no jsonl files in %s", project_base)
+        return events
+
+    # Sort by mtime descending; most recent first
+    jsonl_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    latest_log = jsonl_files[0]
+    session_id_from_log = os.path.splitext(os.path.basename(latest_log))[0]
+    logger.info("_read_claude_project_log: using log=%s for runId=%s cwd=%s", latest_log, run_id[:12], cwd)
+
+    try:
+        with open(latest_log, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                obj_type = obj.get("type", "")
+                msg = obj.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role", "")
+                content_list = msg.get("content", [])
+                if not isinstance(content_list, list):
+                    content_list = [content_list]
+
+                for item in content_list:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type", "")
+                    if item_type == "tool_use":
+                        tool_name = item.get("name", "unknown")
+                        tool_input = item.get("input", {})
+                        # Include truncated input for summary
+                        summary = ""
+                        if isinstance(tool_input, dict):
+                            fp = tool_input.get("file_path", "")
+                            cmd = tool_input.get("command", "")
+                            if fp:
+                                summary = f"file_path={fp}"
+                            elif cmd:
+                                summary = f"command={cmd[:100]}"
+                        events.append({
+                            "type": "tool_use",
+                            "name": tool_name,
+                            "content": json.dumps(tool_input, ensure_ascii=False)[:500],
+                            "summary": summary,
+                            "session_id": session_id_from_log,
+                        })
+                    elif item_type == "tool_result":
+                        content = item.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(str(c) for c in content)
+                        events.append({
+                            "type": "tool_result",
+                            "name": "",
+                            "content": str(content) if content else "ok",
+                            "summary": str(content)[:200] if content else "ok",
+                            "session_id": session_id_from_log,
+                        })
+                    elif item_type == "thinking":
+                        thinking = item.get("thinking", "")
+                        if thinking:
+                            events.append({
+                                "type": "thinking",
+                                "name": "",
+                                "content": thinking,
+                                "summary": thinking[:200],
+                                "session_id": session_id_from_log,
+                            })
+                    elif item_type == "text":
+                        # Skip final text - already delivered via assistant.delta
+                        pass
+
+        logger.info("_read_claude_project_log: parsed %d events from %s", len(events), latest_log)
+    except Exception as e:
+        logger.warning("_read_claude_project_log: failed to read %s: %s", latest_log, e)
+
+    return events
+
+
+def _parse_cc_log_line(line: str) -> dict | None:
+    """解析一行 CC log JSON，转为 Gateway 事件。"""
+    try:
+        obj = json.loads(line.strip())
+    except:
+        return None
+
+    msg = obj.get("message", {})
+    if not isinstance(msg, dict):
+        return None
+
+    content = msg.get("content", [])
+    if not isinstance(content, list):
+        content = [content]
+
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type", "")
+        if item_type == "tool_use":
+            return {
+                "kind": "item.started",
+                "source": "acp",
+                "payload": {
+                    "kind": "tool",
+                    "name": item.get("name", "unknown"),
+                    "title": item.get("name", "unknown"),
+                    "phase": "start",
+                }
+            }
+        elif item_type == "tool_result":
+            content_str = item.get("content", "")
+            if isinstance(content_str, list):
+                content_str = " ".join(str(c) for c in content_str)
+            summary = str(content_str)[:200]
+            return {
+                "kind": "item.completed",
+                "source": "acp",
+                "payload": {
+                    "kind": "tool",
+                    "name": "",
+                    "phase": "end",
+                    "summary": summary,
+                }
+            }
+        elif item_type == "thinking":
+            thinking = item.get("thinking", "")
+            return {
+                "kind": "plan",
+                "source": "acp",
+                "payload": {
+                    "text": thinking[:300],
+                }
+            }
+    return None
+
+
+async def _stream_cc_log(session_key: str, run_id: str, parent_sk: str):
+    """在 CC 运行期间实时 tail project log 并推送事件。"""
+    # 找到 CC project 目录
+    cwd = _acp_run_cwd.get(run_id, "/root/.openclaw/main/workspace/claude")
+    project_dir = _cwd_to_project_dir(cwd)
+    project_base = os.path.expanduser(f"~/.claude/projects/{project_dir}")
+
+    if not os.path.isdir(project_base):
+        logger.info("_stream_cc_log: project dir not found for cwd=%s, will fallback scan", cwd)
+        # fallback: 扫描所有 project dir 找最新
+        projects_base = os.path.expanduser("~/.claude/projects")
+        if os.path.isdir(projects_base):
+            latest_log = None
+            latest_mtime = 0
+            for pd in os.listdir(projects_base):
+                pd_path = os.path.join(projects_base, pd)
+                if not os.path.isdir(pd_path):
+                    continue
+                for f in glob.glob(os.path.join(pd_path, "*.jsonl")):
+                    mtime = os.path.getmtime(f)
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+                        latest_log = f
+            if latest_log:
+                project_base = os.path.dirname(latest_log)
+                logger.info("_stream_cc_log: fallback scan found project_base=%s", project_base)
+
+    if not os.path.isdir(project_base):
+        logger.info("_stream_cc_log: project base not found, giving up")
+        return
+
+    # 记录启动前已有的文件
+    known_files = set(glob.glob(os.path.join(project_base, "*.jsonl")))
+
+    # 等待新文件出现
+    cc_file = None
+    for _ in range(30):  # 最多等 30 秒
+        await asyncio.sleep(1)
+        current = set(glob.glob(os.path.join(project_base, "*.jsonl")))
+        new = current - known_files
+        if new:
+            cc_file = max(new, key=os.path.getmtime)
+            break
+
+    if not cc_file:
+        logger.info("_stream_cc_log: no new CC log file appeared within 30s")
+        return
+
+    logger.info("_stream_cc_log: tailing CC log=%s", cc_file)
+
+    seen_lines = 0
+    while run_id in _active_acp_runs and _active_acp_runs[run_id].get("status") == "running":
+        try:
+            with open(cc_file) as f:
+                lines = f.readlines()
+                new_lines = lines[seen_lines:]
+                seen_lines = len(lines)
+
+                for line in new_lines:
+                    event = _parse_cc_log_line(line)
+                    if event:
+                        await _publish_session_event(parent_sk, event)
+
+                await asyncio.sleep(2)  # poll every 2 seconds
+        except Exception as e:
+            logger.warning("_stream_cc_log: error reading %s: %s", cc_file, e)
+            await asyncio.sleep(2)
+
+    logger.info("_stream_cc_log: finished runId=%s", run_id[:12])
+
+
+async def _push_cc_project_events(session_key: str, run_id: str):
+    """Read CC project log on lifecycle end and push structured events to parent session."""
+    parent_sk = _child_to_parent.get(session_key)
+    if not parent_sk:
+        # fallback to best-effort parent: prefer _agent_run_queues then _session_event_subscribers
+        for psk in list(_agent_run_queues.keys()):
+            if "subagent" not in psk and "acp" not in psk:
+                parent_sk = psk
+                break
+        if not parent_sk:
+            for psk in list(_session_event_subscribers.keys()):
+                if "subagent" not in psk and "acp" not in psk:
+                    parent_sk = psk
+                    break
+    if not parent_sk:
+        # fallback to best-effort parent: prefer _agent_run_queues then _session_event_subscribers
+        for psk in list(_agent_run_queues.keys()):
+            if "subagent" not in psk and "acp" not in psk:
+                parent_sk = psk
+                break
+        if not parent_sk:
+            for psk in list(_session_event_subscribers.keys()):
+                if "subagent" not in psk and "acp" not in psk:
+                    parent_sk = psk
+                    break
+    if not parent_sk:
+        # Last resort: broadcast to all non-child subscribers
+        for psk in list(_session_event_subscribers.keys()):
+            if psk.startswith("agent:") and "subagent" not in psk and "acp" not in psk:
+                parent_sk = psk
+                break
+    if not parent_sk:
+        logger.info("_push_cc_project_events: no parent session found for sessionKey=%s", session_key[:30])
+        return
+
+    cc_events = _read_claude_project_log(session_key, run_id)
+    if not cc_events:
+        logger.info("_push_cc_project_events: no CC events for sessionKey=%s", session_key[:30])
+        return
+
+    logger.info("_push_cc_project_events: publishing %d events to parent=%s", len(cc_events), parent_sk[:40])
+
+    # Build step list for acp_status payload
+    step_list = []
+    for ev in cc_events:
+        ev_type = ev["type"]
+        name = ev["name"]
+        summary = ev["summary"]
+        content = ev["content"]
+        if ev_type == "tool_use":
+            step_list.append({"type": "tool", "name": name, "status": "done", "summary": summary, "output": content[:200]})
+        elif ev_type == "tool_result":
+            if step_list:
+                step_list[-1]["summary"] = summary[:200]
+        elif ev_type == "thinking":
+            step_list.append({"type": "plan", "text": content[:200]})
+
+    # Store steps in active run info so acp_status can include them
+    if run_id in _active_acp_runs:
+        _active_acp_runs[run_id]["steps"] = step_list
+
+    for ev in cc_events:
+        ev_type = ev["type"]
+        name = ev["name"]
+        summary = ev["summary"]
+        content = ev["content"]
+        event_id = f"evt-cc-{uuid.uuid4().hex[:12]}"
+        ts = int(time.time() * 1000)
+
+        if ev_type == "tool_use":
+            await _publish_session_event(parent_sk, {
+                "eventId": event_id,
+                "sessionKey": parent_sk,
+                "runId": run_id,
+                "source": "acp",
+                "ts": ts,
+                "kind": "item.started",
+                "payload": {
+                    "kind": "tool",
+                    "name": name,
+                    "title": f"执行: {name}",
+                    "phase": "start",
+                },
+            })
+        elif ev_type == "tool_result":
+            await _publish_session_event(parent_sk, {
+                "eventId": event_id,
+                "sessionKey": parent_sk,
+                "runId": run_id,
+                "source": "acp",
+                "ts": ts,
+                "kind": "item.completed",
+                "payload": {
+                    "kind": "tool",
+                    "name": name,
+                    "phase": "end",
+                    "summary": summary,
+                    "title": f"完成: {name}",
+                },
+            })
+        elif ev_type == "thinking":
+            await _publish_session_event(parent_sk, {
+                "eventId": event_id,
+                "sessionKey": parent_sk,
+                "runId": run_id,
+                "source": "acp",
+                "ts": ts,
+                "kind": "plan",
+                "payload": {
+                    "text": content[:500],
+                },
+            })
+
+    # After publishing all CC events, mark run as done
+    if run_id in _active_acp_runs:
+        _active_acp_runs[run_id]["status"] = "done"
+        _publish_acp_status()
+        async def _delayed_acp_cleanup(rid=run_id):
+            await asyncio.sleep(5)
+            _active_acp_runs.pop(rid, None)
+            _acp_run_cwd.pop(rid, None)
+            _publish_acp_status()
+        asyncio.create_task(_delayed_acp_cleanup())
+
+
 def _register_global_agent_listener(client):
     """注册全局 agent 事件监听器（只注册一次），同时保存到迁移列表以支持重连"""
     global _agent_listener_registered
@@ -356,6 +876,9 @@ def _register_global_agent_listener(client):
         session_key = payload.get("sessionKey", "")
         stream = payload.get("stream", "")
         data = payload.get("data", {})
+        # 刷新活跃 run 的最后活动时间（任意 agent 事件都算活动）
+        if run_id and run_id in _active_acp_runs and _active_acp_runs[run_id].get("status") == "running":
+            _active_acp_runs[run_id]["last_event_at"] = time.time()
         # 详细打印 lifecycle 和 item 事件
         if stream == "lifecycle":
             logger.info("Agent event: runId=%s, sessionKey=%s, stream=lifecycle, phase=%s, data_keys=%s",
@@ -374,17 +897,100 @@ def _register_global_agent_listener(client):
         # 方式2: assistant delta 中包含 spawn 返回的 JSON（含 childSessionKey）
         if stream == "item" and data.get("name") == "sessions_spawn" and data.get("phase") == "end":
             title = data.get("title", "")
+            meta_raw = data.get("meta", {})
+            logger.info("sessions_spawn end: title=%.200s meta_type=%s meta_keys=%s", title, type(meta_raw).__name__, list(meta_raw.keys()) if isinstance(meta_raw, dict) else str(meta_raw)[:200])
             m = re.search(r'(agent:[\w:.-]+)', title)
             if m:
                 child_sk = m.group(1)
                 _child_to_parent[child_sk] = session_key
                 logger.info("Registered child->parent mapping from spawn title: %s -> %s", child_sk[:50], session_key[:50])
+            # Also check meta.childSessionKey (title may not contain it)
+            meta = data.get("meta", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except:
+                    meta = {}
+            child_sk_from_meta = meta.get("childSessionKey", "") if isinstance(meta, dict) else ""
+            if child_sk_from_meta and child_sk_from_meta not in _child_to_parent:
+                _child_to_parent[child_sk_from_meta] = session_key
+                logger.info("Registered child->parent mapping from meta: %s -> %s", child_sk_from_meta[:50], session_key[:50])
+
         if stream == "assistant" and "childSessionKey" in data.get("delta", ""):
             m = re.search(r'childSessionKey["\':=]+\s*["\']?(agent:[\w:.-]+)', data.get("delta", ""))
             if m:
                 child_sk = m.group(1)
                 _child_to_parent[child_sk] = session_key
                 logger.info("Registered child->parent mapping from assistant delta: %s -> %s", child_sk[:50], session_key[:50])
+
+        # 注册/清理 ACP 活跃 run 状态（全局路径，适用于 /api/chat 等非 legacy 端点）
+        if stream == "lifecycle":
+            phase = data.get("phase", "")
+            is_child_session = "acp" in session_key or "subagent" in session_key
+            if phase == "start" and is_child_session and run_id and run_id not in _active_acp_runs:
+                now = time.time()
+                _active_acp_runs[run_id] = {
+                    "runId": run_id,
+                    "status": "running",
+                    "started_at": now,
+                    "last_event_at": now,
+                }
+                # Capture cwd if available in the lifecycle start payload
+                lifecycle_cwd = data.get("cwd", "") or payload.get("cwd", "")
+                # Fallback: read from Claude Code session file if not in lifecycle event
+                if not lifecycle_cwd and "claude:acp" in session_key:
+                    session_id = session_key.replace("agent:claude:acp:", "")
+                    session_file = os.path.expanduser(f"~/.openclaw/agents/claude/sessions/{session_id}.jsonl")
+                    if os.path.exists(session_file):
+                        try:
+                            with open(session_file) as f:
+                                first_line = f.readline().strip()
+                                if first_line:
+                                    session_info = json.loads(first_line)
+                                    lifecycle_cwd = session_info.get("cwd", "")
+                        except Exception:
+                            pass
+                # Final fallback: known CC workspace directory
+                if not lifecycle_cwd:
+                    lifecycle_cwd = "/root/.openclaw/main/workspace/claude"
+                if lifecycle_cwd:
+                    _acp_run_cwd[run_id] = lifecycle_cwd
+                    logger.info("Stored ACP run cwd: runId=%s cwd=%s", run_id[:12], lifecycle_cwd)
+                _publish_acp_status()
+                logger.info("Registered ACP run from global listener: runId=%s sessionKey=%s", run_id[:12], session_key[:30])
+                # 启动 CC project log 实时流推送
+                if "claude:acp" in session_key:
+                    parent_sk = _child_to_parent.get(session_key)
+                    if not parent_sk:
+                        # fallback: find parent from active subscribers/queues
+                        for psk in list(_session_event_subscribers.keys()):
+                            if "subagent" not in psk and "acp" not in psk:
+                                parent_sk = psk
+                                break
+                        if not parent_sk:
+                            for psk in list(_agent_run_queues.keys()):
+                                if "subagent" not in psk and "acp" not in psk:
+                                    parent_sk = psk
+                                    break
+                    if parent_sk:
+                        asyncio.create_task(_stream_cc_log(session_key, run_id, parent_sk))
+                        logger.info("Started CC log streaming: runId=%s parent=%s", run_id[:12], parent_sk[:30])
+            elif phase == "end" and run_id in _active_acp_runs:
+                # Push Claude Code project log events BEFORE marking done
+                # so they arrive while frontend ACP card is still "running"
+                if "claude:acp" in session_key or "acp" in session_key:
+                    asyncio.create_task(_push_cc_project_events(session_key, run_id))
+                else:
+                    # Non-CC ACP: mark done immediately
+                    _active_acp_runs[run_id]["status"] = "done"
+                    _publish_acp_status()
+                    async def _delayed_acp_cleanup(rid=run_id):
+                        await asyncio.sleep(5)
+                        _active_acp_runs.pop(rid, None)
+                        _acp_run_cwd.pop(rid, None)
+                        _publish_acp_status()
+                    asyncio.create_task(_delayed_acp_cleanup())
+                logger.info("Marked ACP run done from global listener: runId=%s", run_id[:12])
 
         # 用 sessionKey 匹配活跃 queue
         q = _agent_run_queues.get(session_key)
@@ -405,35 +1011,38 @@ def _register_global_agent_listener(client):
                         payload = _cache_child_event(parent_sk, payload) or payload
                         q = parent_q
                 else:
-                    # fallback：优先 agent:main:，其次其他非子 agent session
-                    best_parent_sk, best_parent_q = None, None
-                    for psk, pq in list(_agent_run_queues.items()):
-                        if "subagent" in psk or "acp" in psk:
-                            continue
-                        if psk.startswith("agent:main:"):
-                            best_parent_sk, best_parent_q = psk, pq
-                            break
-                        if best_parent_sk is None:
-                            best_parent_sk, best_parent_q = psk, pq
-                    if best_parent_q and stream in ("assistant", "item", "lifecycle", "command_output"):
-                        logger.info("Forwarding child agent event to parent (fallback): %s -> %s, stream=%s", session_key[:30], best_parent_sk[:30], stream)
+                    # Parent mapped but no legacy queue (v2 mode or disconnected).
+                    # Do NOT fallback to random queues — just cache for persistent subscribers.
+                    if parent_sk and stream in ("assistant", "item", "lifecycle", "command_output"):
                         payload["_is_child"] = True
-                        payload["_delivered_to_parent_queue"] = True
-                        _child_to_parent[session_key] = best_parent_sk
-                        payload = _cache_child_event(best_parent_sk, payload) or payload
-                        q = best_parent_q
+                        payload["_delivered_to_parent_queue"] = False
+                        payload = _cache_child_event(parent_sk, payload) or payload
+                        logger.info(
+                            "Cached child event (v2/no-queue): child=%s -> parent=%s, stream=%s, cached=%d",
+                            session_key[:30],
+                            parent_sk[:30],
+                            stream,
+                            len(_child_events_cache.get(parent_sk, [])),
+                        )
 
-                if not q and parent_sk and stream in ("assistant", "item", "lifecycle", "command_output"):
-                    payload["_is_child"] = True
-                    payload["_delivered_to_parent_queue"] = False
-                    payload = _cache_child_event(parent_sk, payload) or payload
-                    logger.info(
-                        "Cached child event without active parent queue: child=%s -> parent=%s, stream=%s, cached=%d",
-                        session_key[:30],
-                        parent_sk[:30],
-                        stream,
-                        len(_child_events_cache.get(parent_sk, [])),
-                    )
+        # ── H5 过滤：主 agent 的工具调用卡片不在前端显示 ──
+        # 此过滤放在 spawn 映射注册、lifecycle 追踪之后，queue 推送 / publish 之前
+        if stream == "item":
+            # 仅过滤主 agent（非 subagent/acp 会话）
+            session_key_str = session_key or ""
+            is_child_session = "subagent" in session_key_str or "acp" in session_key_str
+            is_child_flag = payload.get("_is_child")
+            if not is_child_session and not is_child_flag:
+                # 显式键访问：data 已在上方提取为 dict
+                if "name" in data:
+                    tool_name = data["name"]
+                    if tool_name in _H5_FILTERED_MAIN_AGENT_TOOLS:
+                        phase_str = data["phase"] if "phase" in data else ""
+                        logger.info(
+                            "H5 filter: skip main agent tool item, name=%s phase=%s sessionKey=%s",
+                            tool_name, phase_str, session_key_str[:40],
+                        )
+                        return
 
         # 写入缓存（用 chat.send 返回的 runId）
         chat_run_id = _agent_session_to_run.get(session_key, "")
@@ -632,6 +1241,36 @@ async def event_stream(
                 "payload": snapshot,
             }
             yield f"data: {json.dumps(snap_event, ensure_ascii=False)}\n\n"
+            # 发送当前 ACP 状态（快照前清理僵尸 run）
+            now = time.time()
+            stale_rids = []
+            for rid, info in list(_active_acp_runs.items()):
+                if info.get("status") == "running" and now - info.get("last_event_at", info.get("started_at", 0)) > 600:
+                    _active_acp_runs[rid]["status"] = "timeout"
+                    stale_rids.append(rid)
+            if stale_rids:
+                logger.warning("Event snapshot: marked %d inactive acp runs as timeout", len(stale_rids))
+                _publish_acp_status()
+                async def _snapshot_delayed_cleanup(rids):
+                    await asyncio.sleep(5)
+                    for rid in rids:
+                        _active_acp_runs.pop(rid, None)
+                        _acp_run_cwd.pop(rid, None)
+                    _publish_acp_status()
+                asyncio.create_task(_snapshot_delayed_cleanup(stale_rids))
+            acp_runs = []
+            for rid, info in list(_active_acp_runs.items()):
+                if info.get("status") == "timeout":
+                    continue
+                acp_runs.append({"runId": rid, "status": info.get("status", "running")})
+            acp_status_event = {
+                "eventId": f"evt-acp-init-{uuid.uuid4().hex[:12]}",
+                "sessionKey": sessionKey,
+                "kind": "acp_status",
+                "ts": int(time.time() * 1000),
+                "payload": {"count": len(acp_runs), "runs": acp_runs}
+            }
+            yield f"data: {json.dumps(acp_status_event, ensure_ascii=False)}\n\n"
             logger.info("Event stream opened: sessionKey=%s subscriber=%s snapshot_runs=%d", sessionKey[:30], subscriber_id[:8], len(snapshot.get("activeRuns", {})))
 
             while True:
@@ -642,6 +1281,8 @@ async def event_stream(
                     yield f"event: ping\ndata: {{\"ts\": {int(time.time() * 1000)}}}\n\n"
         except asyncio.CancelledError:
             logger.info("Event stream cancelled: sessionKey=%s subscriber=%s", sessionKey[:30], subscriber_id[:8])
+        except Exception as e:
+            logger.warning("Event stream error: sessionKey=%s subscriber=%s error=%s", sessionKey[:30], subscriber_id[:8], e)
         finally:
             _unregister_session_subscriber(sessionKey, subscriber_id)
 
@@ -750,6 +1391,13 @@ def _get_session_key(user: dict) -> str:
     """Get current session key from DB (server-side)."""
     agent_id = _agent_id(user['role'])
     return users.get_or_create_session(user['id'], agent_id)
+
+
+def _gateway_session_key(session_key: str, agent_id: str) -> str:
+    """Return the Gateway-prefixed session key for chat.history RPC."""
+    if session_key.startswith("agent:"):
+        return session_key
+    return f"agent:{agent_id}:{session_key}"
 
 
 async def _get_active_session_model(client, session_key: str) -> str:
@@ -903,13 +1551,12 @@ async def history(
     user=Depends(get_current_user),
 ):
     client = await get_client()
-    # Use query param sessionKey if provided, otherwise use active session
-    if sessionKey:
-        sk = sessionKey
-    else:
-        sk = _get_session_key(user)
+    # Gateway history requires agent:{agent_id}:{sessionKey} prefix
+    agent_id = _agent_id(user['role'])
+    sk = sessionKey or users.get_or_create_session(user['id'], agent_id)
+    full_sk = _gateway_session_key(sk, agent_id)
     res = await client.rpc("chat.history", {
-        "sessionKey": sk,
+        "sessionKey": full_sk,
         "limit": limit,
     })
     if not res.get("ok"):
@@ -1233,6 +1880,17 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
                     if item_name == "sessions_spawn" or "spawn" in item_name.lower():
                         has_spawned_subagent = True
                         logger.info("SSE detected sub-agent spawn. sessionKey=%s", session_key)
+                        # 注册 ACP run 到状态追踪
+                        _run_id_for_acp = _agent_session_to_run.get(session_key)
+                        if _run_id_for_acp and _run_id_for_acp not in _active_acp_runs:
+                            now = time.time()
+                            _active_acp_runs[_run_id_for_acp] = {
+                                "runId": _run_id_for_acp,
+                                "status": "running",
+                                "started_at": now,
+                                "last_event_at": now,
+                            }
+                            _publish_acp_status()
 
                     if item_kind == "tool":
                         if item_phase == "start":
@@ -1282,7 +1940,11 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
                 elif stream == "lifecycle":
                     phase = data.get("phase", "unknown")
                     logger.info("SSE lifecycle phase=%s, runId=%s, sessionKey=%s", phase, event.get("runId", "")[:12], session_key[:20])
-                    if phase == "end":
+                    if phase == "error":
+                        error_text = data.get("error", "")
+                        if error_text:
+                            yield f"data: {json.dumps({'type': 'error', 'message': error_text}, ensure_ascii=False)}\n\n"
+                    elif phase == "end":
                         if buffering_assistant_text and assistant_buffer.strip() in _FILTERED_STREAM_TEXTS:
                             _is_filtered_reply[0] = True
                             logger.info(
@@ -1311,6 +1973,16 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
             logger.exception("Stream error")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
         finally:
+            # 标记 ACP run 为完成
+            if run_id in _active_acp_runs:
+                _active_acp_runs[run_id]["status"] = "done"
+                _publish_acp_status()
+                # 5秒后清理
+                async def _delayed_acp_cleanup(rid=run_id):
+                    await asyncio.sleep(5)
+                    _active_acp_runs.pop(rid, None)
+                    _publish_acp_status()
+                asyncio.create_task(_delayed_acp_cleanup())
             # 只清理 queue（停止接收新事件），但保留 session→run 映射和 cache
             # 这样 announce 事件仍能写入 cache，前端可轮询获取
             if _agent_run_queues.get(session_key) is event_queue:
@@ -1327,29 +1999,37 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
             try:
                 await asyncio.sleep(1)  # 等 Gateway 写入 history
                 client = await get_client()
-                hist = await client.rpc("session.history", {
-                    "sessionKey": session_key,
-                    "limit": 5,
-                })
-                messages = hist.get("messages", [])
-                # 找最后一条 assistant 消息
-                for msg in reversed(messages):
-                    if msg.get("role") == "assistant":
-                        full_text = msg.get("content", "")
-                        if full_text and isinstance(full_text, str):
-                            if full_text in _FILTERED_STREAM_TEXTS or _is_filtered_reply[0]:
-                                logger.info(
-                                    "SSE full_result suppressed for sessionKey=%s, text=%s, pushed_valid_text=%s, filtered_reply=%s",
-                                    session_key[:30],
-                                    full_text,
-                                    pushed_valid_text,
-                                    _is_filtered_reply[0],
-                                )
-                            else:
-                                # 推送完整结果（前端可用来补全/替换）
-                                yield f"data: {json.dumps({'type': 'full_result', 'text': full_text}, ensure_ascii=False)}\n\n"
-                                logger.info("SSE full_result sent for sessionKey=%s, text_len=%d", session_key[:30], len(full_text))
-                        break
+                # Gateway session.history requires agent-prefixed keys
+                session_keys_to_try = [session_key]
+                if not session_key.startswith("agent:"):
+                    for agent_id in ("dev", "user", "main"):
+                        session_keys_to_try.append(f"agent:{agent_id}:{session_key}")
+                full_text = ""
+                for sk in session_keys_to_try:
+                    try:
+                        hist = await client.rpc("session.history", {"sessionKey": sk, "limit": 5})
+                        messages = hist.get("messages", [])
+                        for msg in reversed(messages):
+                            if msg.get("role") == "assistant":
+                                text = msg.get("content", "")
+                                if text and isinstance(text, str) and text.strip() not in _FILTERED_STREAM_TEXTS:
+                                    full_text = text
+                                break
+                        if full_text:
+                            break
+                    except Exception:
+                        continue
+                if full_text and not _is_filtered_reply[0]:
+                    yield f"data: {json.dumps({'type': 'full_result', 'text': full_text}, ensure_ascii=False)}\n\n"
+                    logger.info("SSE full_result sent for sessionKey=%s, text_len=%d", session_key[:30], len(full_text))
+                else:
+                    logger.info(
+                        "SSE full_result suppressed for sessionKey=%s, text=%s, pushed_valid_text=%s, filtered_reply=%s",
+                        session_key[:30],
+                        full_text,
+                        pushed_valid_text,
+                        _is_filtered_reply[0],
+                    )
             except Exception as e:
                 logger.warning("SSE history fallback failed: %s", e)
 
@@ -1386,7 +2066,7 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
 
 @app.post("/api/chat")
 @app.post("/api/chat/v2")
-async def chat_send(req: ChatReq, user=Depends(get_current_user)):
+async def chat_send(req: ChatReq, request: Request, user=Depends(get_current_user)):
     """Phase 2: JSON-only chat endpoint (no SSE response).
 
     Sends the message to Gateway, returns immediately with runId.
@@ -1425,10 +2105,17 @@ async def chat_send(req: ChatReq, user=Depends(get_current_user)):
 
     _run_cache[run_id] = {"events": [], "status": "streaming", "created_at": time.time()}
     _run_to_parent_session[run_id] = session_key
-
-    event_queue: asyncio.Queue = asyncio.Queue()
-    _agent_run_queues[session_key] = event_queue
     _agent_session_to_run[session_key] = run_id
+
+    # Only create legacy SSE queue for /api/chat (not /api/chat/v2).
+    # In v2 mode events are consumed via persistent /api/events subscribers.
+    is_v2 = request.url.path.endswith("/v2")
+    if not is_v2:
+        event_queue: asyncio.Queue = asyncio.Queue()
+        _agent_run_queues[session_key] = event_queue
+        logger.info("chat_send: registered legacy queue for sessionKey=%s", session_key[:30])
+    else:
+        logger.info("chat_send: v2 mode, skipping legacy queue for sessionKey=%s", session_key[:30])
 
     # Publish run.started event to persistent subscribers
     await _publish_session_event(session_key, {
@@ -1544,3 +2231,553 @@ async def upload_file(
 
     url = cos_util.upload_file(content, file.filename, content_type)
     return {"url": url, "filename": file.filename}
+
+
+@app.get("/api/download")
+async def download_file(
+    url: str = Query(None, description="File URL to download"),
+    path: str = Query(None, description="Local file path to download"),
+    filename: str = Query(None, description="Optional filename override"),
+    user=Depends(get_current_user),
+):
+    """Proxy file download with proper Content-Disposition header.
+
+    Fetches a file from the given URL or local path and returns it with
+    attachment headers, enabling reliable cross-origin downloads on mobile browsers.
+    """
+    import requests
+    from urllib.parse import urlparse, unquote
+
+    # Determine target and fetch strategy
+    target_url = None
+    local_path = None
+
+    if path and os.path.isfile(path):
+        local_path = path
+    elif url and url.startswith(("http://", "https://")):
+        target_url = url
+    elif url and os.path.isfile(url):
+        # Some callers pass a local path in the url param
+        local_path = url
+    else:
+        raise HTTPException(400, "Invalid or missing url/path")
+
+    # Determine display filename
+    if filename:
+        display_name = filename
+    elif target_url:
+        parsed = urlparse(target_url)
+        display_name = unquote(os.path.basename(parsed.path)) or "download"
+    elif local_path:
+        display_name = os.path.basename(local_path)
+    else:
+        display_name = "download"
+
+    if local_path:
+        # Serve local file directly
+        if not os.path.isfile(local_path):
+            raise HTTPException(404, "File not found")
+
+        def _local_iter():
+            with open(local_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+
+        # Guess content type from extension
+        import mimetypes
+        content_type, _ = mimetypes.guess_type(local_path)
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{display_name}"',
+            "Content-Type": content_type,
+        }
+        return StreamingResponse(_local_iter(), headers=headers)
+
+    # Proxy remote URL via requests streaming
+    loop = asyncio.get_event_loop()
+
+    def _stream():
+        resp = requests.get(target_url, stream=True, timeout=60, headers={
+            "User-Agent": "Mozilla/5.0 (H5-Chat-Bridge)"
+        })
+        resp.raise_for_status()
+        return resp
+
+    try:
+        resp = await loop.run_in_executor(None, _stream)
+    except Exception as e:
+        logger.warning("Download proxy failed for %s: %s", target_url[:100], e)
+        raise HTTPException(502, f"Failed to fetch file: {e}")
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{display_name}"',
+    }
+    if resp.headers.get("content-type"):
+        headers["Content-Type"] = resp.headers["content-type"]
+
+    return StreamingResponse(
+        resp.iter_content(chunk_size=65536),
+        headers=headers,
+    )
+
+
+# ── ACP Agent Log Streaming ─────────────────────────────────────
+
+def _find_kimi_log_file() -> str | None:
+    """Find the current active Kimi Code log file."""
+    kimi_log = os.path.expanduser("~/.kimi/logs/kimi.log")
+    if os.path.isfile(kimi_log):
+        return kimi_log
+    logs = glob.glob(os.path.expanduser("~/.kimi/logs/kimi.*.log"))
+    if logs:
+        return max(logs, key=os.path.getmtime)
+    return None
+
+
+def _find_claude_log_file() -> str | None:
+    """Find the most recently modified Claude Code project jsonl file."""
+    projects_base = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(projects_base):
+        return None
+    latest_file = None
+    latest_mtime = 0
+    for pd in os.listdir(projects_base):
+        pd_path = os.path.join(projects_base, pd)
+        if not os.path.isdir(pd_path):
+            continue
+        for f in glob.glob(os.path.join(pd_path, "*.jsonl")):
+            mtime = os.path.getmtime(f)
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+                latest_file = f
+    return latest_file
+
+
+_UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
+
+
+def _find_kimi_sessions() -> list[dict]:
+    """Extract active session IDs from kimi.log (last 30 minutes).
+
+    Returns list of {"id": session_id, "label": str, "mtime": float}
+    """
+    sessions: dict[str, dict] = {}
+    kimi_log = os.path.expanduser("~/.kimi/logs/kimi.log")
+    if not os.path.isfile(kimi_log):
+        return []
+
+    cutoff = time.time() - 1800  # 30 minutes ago
+    try:
+        # Read last ~2000 lines for efficiency
+        with open(kimi_log, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            read_size = min(size, 512 * 1024)  # last 512KB
+            f.seek(size - read_size)
+            lines = f.readlines()
+            # Skip first partial line
+            if size > read_size and lines:
+                lines = lines[1:]
+    except Exception:
+        return []
+
+    for line in lines:
+        # Parse timestamp: 2026-04-28 08:03:47.627 | ...
+        m = re.match(r'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d+)', line)
+        if not m:
+            continue
+        try:
+            from datetime import datetime
+            ts_str = m.group(1) + " " + m.group(2).split('.')[0]
+            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        for match in _UUID_RE.finditer(line):
+            sid = match.group(0).lower()
+            sessions[sid] = {"id": sid, "label": sid[:8], "mtime": ts}
+
+    return sorted(sessions.values(), key=lambda s: s["mtime"], reverse=True)
+
+
+def _find_claude_sessions() -> list[dict]:
+    """List active Claude Code project jsonl files as sessions.
+
+    Only returns files modified within the last 30 minutes.
+
+    Returns list of {"id": session_id, "label": str, "mtime": float, "project": str}
+    """
+    sessions = []
+    projects_base = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(projects_base):
+        return sessions
+
+    cutoff = time.time() - 1800  # 30 minutes ago
+
+    for pd in os.listdir(projects_base):
+        pd_path = os.path.join(projects_base, pd)
+        if not os.path.isdir(pd_path):
+            continue
+        for f in glob.glob(os.path.join(pd_path, "*.jsonl")):
+            sid = os.path.splitext(os.path.basename(f))[0]
+            try:
+                mtime = os.path.getmtime(f)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            sessions.append({
+                "id": sid,
+                "label": sid[:8],
+                "mtime": mtime,
+                "project": pd,
+            })
+
+    return sorted(sessions, key=lambda s: s["mtime"], reverse=True)
+
+
+def _find_claude_log_by_session(session_id: str) -> str | None:
+    """Find Claude jsonl file by session ID."""
+    projects_base = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(projects_base):
+        return None
+    for pd in os.listdir(projects_base):
+        pd_path = os.path.join(projects_base, pd)
+        if not os.path.isdir(pd_path):
+            continue
+        for f in glob.glob(os.path.join(pd_path, "*.jsonl")):
+            sid = os.path.splitext(os.path.basename(f))[0]
+            if sid.lower() == session_id.lower():
+                return f
+    return None
+
+
+def _format_claude_log_line(line: str) -> str | None:
+    """Parse a Claude Code JSONL line into human-readable log text.
+
+    Returns formatted text like:
+      [10:29:36] [ASSISTANT] tool_use: Bash(command="...")
+      [10:29:36] [USER] tool_result: tail: option used in invalid context -- 5
+      [10:29:40] [ASSISTANT] thinking: 让我修正 tail 命令...
+    """
+    try:
+        obj = json.loads(line.strip())
+    except Exception:
+        return None
+
+    ts_raw = obj.get("timestamp", "")
+    ts = ""
+    if ts_raw:
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            ts = dt.strftime("%H:%M:%S")
+        except Exception:
+            ts = ts_raw[11:19] if len(ts_raw) >= 19 else ""
+
+    msg_type = obj.get("type", "")
+    msg = obj.get("message", {})
+    if not isinstance(msg, dict):
+        return None
+
+    role = msg.get("role", msg_type)
+    content_list = msg.get("content", [])
+    if not isinstance(content_list, list):
+        content_list = [content_list]
+
+    lines = []
+    prefix = f"[{ts}] [{role.upper()}]" if ts else f"[{role.upper()}]"
+
+    for item in content_list:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type", "")
+        if item_type == "tool_use":
+            name = item.get("name", "unknown")
+            inp = item.get("input", {})
+            inp_str = json.dumps(inp, ensure_ascii=False)
+            if len(inp_str) > 200:
+                inp_str = inp_str[:200] + "..."
+            lines.append(f"{prefix} tool_use: {name}({inp_str})")
+        elif item_type == "tool_result":
+            content_str = item.get("content", "")
+            if isinstance(content_str, list):
+                content_str = " ".join(str(c) for c in content_str)
+            is_error = item.get("is_error", False)
+            err_flag = " [ERROR]" if is_error else ""
+            text = str(content_str).replace("\n", " ")[:300]
+            lines.append(f"{prefix} tool_result: {text}{err_flag}")
+        elif item_type == "thinking":
+            thinking = item.get("thinking", "")
+            if thinking:
+                text = str(thinking).replace("\n", " ")[:300]
+                lines.append(f"{prefix} thinking: {text}")
+        elif item_type == "text":
+            text = item.get("text", "")
+            if text:
+                text = str(text).replace("\n", " ")[:300]
+                lines.append(f"{prefix} text: {text}")
+        else:
+            # Unknown item type - include raw for completeness
+            raw = json.dumps(item, ensure_ascii=False)[:200]
+            lines.append(f"{prefix} {item_type}: {raw}")
+
+    return "\n".join(lines) if lines else None
+
+
+async def _tail_log_file(
+    filepath: str,
+    lines: int = 0,
+    follow: bool = True,
+    poll_interval: float = 0.5,
+    is_jsonl: bool = False,
+    session_id_filter: str = "",
+):
+    """Async generator that yields log lines from a file with rotation detection."""
+    if not filepath or not os.path.isfile(filepath):
+        return
+
+    try:
+        stat = os.stat(filepath)
+        initial_size = stat.st_size
+        initial_ino = stat.st_ino
+    except OSError:
+        return
+
+    current_ino = initial_ino
+    current_path = filepath
+
+    try:
+        f = open(current_path, "r", encoding="utf-8", errors="replace")
+
+        # Read initial lines if requested
+        if lines > 0:
+            all_lines = f.readlines()
+            for line in all_lines[-lines:]:
+                stripped = line.rstrip("\n")
+                if session_id_filter and session_id_filter.lower() not in stripped.lower():
+                    continue
+                yield stripped
+            f.seek(0, 2)  # Seek to end
+        else:
+            # Read all existing lines
+            for line in f:
+                stripped = line.rstrip("\n")
+                if session_id_filter and session_id_filter.lower() not in stripped.lower():
+                    continue
+                yield stripped
+
+        if not follow:
+            f.close()
+            return
+
+        # Follow mode
+        while True:
+            await asyncio.sleep(poll_interval)
+
+            # Check for rotation
+            try:
+                new_stat = os.stat(current_path)
+                if new_stat.st_ino != current_ino:
+                    current_ino = new_stat.st_ino
+                    f.close()
+                    f = open(current_path, "r", encoding="utf-8", errors="replace")
+                    logger.info("Log file rotated (inode changed), reopened: %s", current_path)
+                    continue
+            except FileNotFoundError:
+                # File deleted/rotated - try to find replacement
+                if is_jsonl:
+                    new_path = _find_claude_log_file()
+                else:
+                    new_path = _find_kimi_log_file()
+
+                if new_path and new_path != current_path:
+                    current_path = new_path
+                    current_ino = os.stat(current_path).st_ino
+                    f.close()
+                    f = open(current_path, "r", encoding="utf-8", errors="replace")
+                    logger.info("Log file rotated to new file: %s", current_path)
+                    continue
+                else:
+                    continue
+            except OSError:
+                continue
+
+            # Read new lines
+            new_lines = f.readlines()
+            for line in new_lines:
+                stripped = line.rstrip("\n")
+                if session_id_filter and session_id_filter.lower() not in stripped.lower():
+                    continue
+                yield stripped
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("Tail error for %s: %s", current_path, e)
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
+@app.get("/api/acp/log/status")
+async def acp_log_status(authorization: str = Header(None), token: str = Query(None)):
+    """Return current agent log file availability and active sessions."""
+    # Auth: support both header and query param
+    _token = None
+    if authorization and authorization.startswith("Bearer "):
+        _token = authorization[7:]
+    elif token:
+        _token = token
+    if not _token:
+        raise HTTPException(401, "Missing Bearer token")
+    user = users.verify_token(_token)
+    if not user:
+        raise HTTPException(401, "Invalid or expired token")
+
+    from datetime import datetime
+
+    result = {
+        "agents": {},
+        "ts": int(time.time() * 1000),
+    }
+
+    # Kimi
+    kimi_log = _find_kimi_log_file()
+    if kimi_log:
+        try:
+            st = os.stat(kimi_log)
+            result["agents"]["kimi"] = {
+                "available": True,
+                "path": kimi_log,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "mtimeIso": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                "sessions": _find_kimi_sessions(),
+            }
+        except OSError:
+            result["agents"]["kimi"] = {"available": False, "sessions": []}
+    else:
+        result["agents"]["kimi"] = {"available": False, "sessions": []}
+
+    # Claude
+    claude_log = _find_claude_log_file()
+    claude_sessions = _find_claude_sessions()
+    if claude_log:
+        try:
+            st = os.stat(claude_log)
+            result["agents"]["claude"] = {
+                "available": True,
+                "path": claude_log,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "mtimeIso": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                "sessions": claude_sessions,
+            }
+        except OSError:
+            result["agents"]["claude"] = {"available": False, "sessions": claude_sessions}
+    else:
+        result["agents"]["claude"] = {"available": False, "sessions": claude_sessions}
+
+    return result
+
+
+@app.get("/api/acp/log/{agent}")
+async def acp_log_stream(
+    agent: str,
+    authorization: str = Header(None),
+    token: str = Query(None),
+    follow: bool = Query(True),
+    lines: int = Query(50, ge=0, le=500),
+    sessionId: str = Query(None),
+):
+    """SSE stream of agent log files.
+
+    - agent=kimi  -> tail ~/.kimi/logs/kimi.log
+    - agent=claude -> tail ~/.claude/projects/<project>/*.jsonl (or specific session)
+    - ?follow=true  -> keep streaming new lines
+    - ?lines=N      -> return last N lines before following
+    - ?token=xxx    -> auth via query param (for EventSource)
+    - ?sessionId=xxx -> filter to specific session (kimi: inline filter, claude: direct file)
+    """
+    # Auth: support both header (Authorization: Bearer xxx) and query param (?token=xxx)
+    _token = None
+    if authorization and authorization.startswith("Bearer "):
+        _token = authorization[7:]
+    elif token:
+        _token = token
+    if not _token:
+        raise HTTPException(401, "Missing Bearer token")
+    user = users.verify_token(_token)
+    if not user:
+        raise HTTPException(401, "Invalid or expired token")
+
+    if agent not in ("kimi", "claude"):
+        raise HTTPException(400, "agent must be 'kimi' or 'claude'")
+
+    if agent == "kimi":
+        filepath = _find_kimi_log_file()
+        is_jsonl = False
+        session_filter = sessionId or ""
+    else:
+        if sessionId:
+            filepath = _find_claude_log_by_session(sessionId)
+            is_jsonl = True
+            session_filter = ""
+        else:
+            filepath = _find_claude_log_file()
+            is_jsonl = True
+            session_filter = ""
+
+    if not filepath:
+        raise HTTPException(404, f"No log file found for agent={agent} sessionId={sessionId}")
+
+    async def generate():
+        try:
+            async for line in _tail_log_file(
+                filepath, lines=lines, follow=follow, is_jsonl=is_jsonl, session_id_filter=session_filter
+            ):
+                if is_jsonl:
+                    formatted = _format_claude_log_line(line)
+                    event = {
+                        "ts": int(time.time() * 1000),
+                        "agent": agent,
+                        "line": line[:4000],
+                        "formatted": formatted,
+                    }
+                else:
+                    event = {
+                        "ts": int(time.time() * 1000),
+                        "agent": agent,
+                        "line": line[:4000],
+                    }
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+            if not follow:
+                yield f"event: done\ndata: {{\"agent\": \"{agent}\"}}\n\n"
+        except asyncio.CancelledError:
+            logger.info("ACP log stream cancelled for agent=%s sessionId=%s", agent, sessionId)
+        except Exception as e:
+            logger.warning("ACP log stream error for agent=%s sessionId=%s: %s", agent, sessionId, e)
+            yield f"event: error\ndata: {{\"error\": \"{str(e)}\"}}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+
