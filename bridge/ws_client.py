@@ -48,8 +48,8 @@ class GatewayWSClient:
         # 2) Build signed connect request
         device_auth = device.build_device_auth(
             self.private_key, nonce, config.GW_TOKEN,
-            client_id="webchat",
-            client_mode="webchat",
+            client_id="gateway-client",
+            client_mode="backend",
         )
 
         connect_req = {
@@ -60,10 +60,10 @@ class GatewayWSClient:
                 "minProtocol": 3,
                 "maxProtocol": 3,
                 "client": {
-                    "id": "webchat",
+                    "id": "gateway-client",
                     "version": "1.0.0",
                     "platform": "linux",
-                    "mode": "webchat",
+                    "mode": "backend",
                 },
                 "role": "operator",
                 "scopes": ["operator.read", "operator.write"],

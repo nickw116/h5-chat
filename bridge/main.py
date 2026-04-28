@@ -9,6 +9,7 @@ import uuid
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Query, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -319,18 +320,36 @@ async def _publish_session_event(session_key: str, event: dict):
             if len(parts) == 3 and parts[2]:
                 tried_keys.add(parts[2])
 
+    all_keys = list(_session_event_subscribers.keys())
+    logger.info(
+        "_publish_session_event: session_key=%s tried_keys=%s all_subscriber_keys=%s all_subscriber_counts=%s event_kind=%s",
+        session_key,
+        tried_keys,
+        all_keys,
+        {k: len(v) for k, v in _session_event_subscribers.items()},
+        event.get("kind"),
+    )
+
+    found_any = False
     for sk in tried_keys:
         subscribers = _session_event_subscribers.get(sk, {})
         if not subscribers:
             continue
+        found_any = True
+        logger.info("_publish_session_event: found %d subscribers for key=%s", len(subscribers), sk)
         stale_ids = []
         for subscriber_id, queue in list(subscribers.items()):
             try:
                 queue.put_nowait(event)
-            except Exception:
+                logger.info("_publish_session_event: queued event for subscriber=%s key=%s", subscriber_id[:8], sk)
+            except Exception as e:
+                logger.warning("_publish_session_event: put_nowait failed for subscriber=%s key=%s: %s", subscriber_id[:8], sk, e)
                 stale_ids.append(subscriber_id)
         for subscriber_id in stale_ids:
             _unregister_session_subscriber(sk, subscriber_id)
+
+    if not found_any:
+        logger.warning("_publish_session_event: NO subscribers found for any tried key. session_key=%s tried_keys=%s", session_key, tried_keys)
 
 
 def _child_event_fields(payload: dict) -> dict:
@@ -414,6 +433,7 @@ async def _publish_gateway_event(session_key: str, run_id: str, stream: str, pay
     """Convert raw Gateway agent event into a rich event and publish to persistent subscribers."""
     if not session_key:
         return
+    logger.info("_publish_gateway_event: ENTER session_key=%s run_id=%s stream=%s", session_key, run_id[:12], stream)
     data = payload.get("data", {}) if isinstance(payload, dict) else {}
     is_child = bool(payload.get("_is_child"))
     source = "acp" if is_child else "main"
@@ -1010,39 +1030,20 @@ def _register_global_agent_listener(client):
                         payload["_delivered_to_parent_queue"] = True
                         payload = _cache_child_event(parent_sk, payload) or payload
                         q = parent_q
-                else:
-                    # Parent mapped but no legacy queue (v2 mode or disconnected).
-                    # Do NOT fallback to random queues — just cache for persistent subscribers.
-                    if parent_sk and stream in ("assistant", "item", "lifecycle", "command_output"):
-                        payload["_is_child"] = True
-                        payload["_delivered_to_parent_queue"] = False
-                        payload = _cache_child_event(parent_sk, payload) or payload
-                        logger.info(
-                            "Cached child event (v2/no-queue): child=%s -> parent=%s, stream=%s, cached=%d",
-                            session_key[:30],
-                            parent_sk[:30],
-                            stream,
-                            len(_child_events_cache.get(parent_sk, [])),
-                        )
-
-        # ── H5 过滤：主 agent 的工具调用卡片不在前端显示 ──
-        # 此过滤放在 spawn 映射注册、lifecycle 追踪之后，queue 推送 / publish 之前
-        if stream == "item":
-            # 仅过滤主 agent（非 subagent/acp 会话）
-            session_key_str = session_key or ""
-            is_child_session = "subagent" in session_key_str or "acp" in session_key_str
-            is_child_flag = payload.get("_is_child")
-            if not is_child_session and not is_child_flag:
-                # 显式键访问：data 已在上方提取为 dict
-                if "name" in data:
-                    tool_name = data["name"]
-                    if tool_name in _H5_FILTERED_MAIN_AGENT_TOOLS:
-                        phase_str = data["phase"] if "phase" in data else ""
-                        logger.info(
-                            "H5 filter: skip main agent tool item, name=%s phase=%s sessionKey=%s",
-                            tool_name, phase_str, session_key_str[:40],
-                        )
-                        return
+                    else:
+                        # Parent mapped but no legacy queue (v2 mode or disconnected).
+                        # Do NOT fallback to random queues — just cache for persistent subscribers.
+                        if stream in ("assistant", "item", "lifecycle", "command_output"):
+                            payload["_is_child"] = True
+                            payload["_delivered_to_parent_queue"] = False
+                            payload = _cache_child_event(parent_sk, payload) or payload
+                            logger.info(
+                                "Cached child event (v2/no-queue): child=%s -> parent=%s, stream=%s, cached=%d",
+                                session_key[:30],
+                                parent_sk[:30],
+                                stream,
+                                len(_child_events_cache.get(parent_sk, [])),
+                            )
 
         # 写入缓存（用 chat.send 返回的 runId）
         chat_run_id = _agent_session_to_run.get(session_key, "")
@@ -2214,8 +2215,9 @@ async def abort_chat(sessionKey: str = Query(None), user=Depends(get_current_use
 async def upload_file(
     file: UploadFile = File(...),
     user=Depends(get_current_user),
+    storage: str = Query("local", description="存储方式: local(默认) 或 cos"),
 ):
-    """上传文件到 COS，返回公开访问 URL"""
+    """上传文件，默认存本地服务器，storage=cos 时上传到腾讯云 COS"""
     if not file.filename:
         raise HTTPException(400, "文件名不能为空")
 
@@ -2226,11 +2228,23 @@ async def upload_file(
     if len(content) > 300 * 1024 * 1024:
         raise HTTPException(413, "文件大小不能超过 50MB")
 
-    # 根据文件类型设置 Content-Type
-    content_type = file.content_type or "application/octet-stream"
+    if storage == "cos":
+        # COS 链路
+        content_type = file.content_type or "application/octet-stream"
+        url = cos_util.upload_file(content, file.filename, content_type)
+        return {"url": url, "filename": file.filename, "storage": "cos"}
 
-    url = cos_util.upload_file(content, file.filename, content_type)
-    return {"url": url, "filename": file.filename}
+    # 默认：本地存储
+    date_dir = datetime.now().strftime("%Y%m%d")
+    assets_dir = os.path.join("/var/www/chat/assets", date_dir)
+    os.makedirs(assets_dir, exist_ok=True)
+
+    local_path = os.path.join(assets_dir, file.filename)
+    with open(local_path, "wb") as f:
+        f.write(content)
+
+    url = f"https://www.nickhome.cloud/chat/assets/{date_dir}/{file.filename}"
+    return {"url": url, "filename": file.filename, "storage": "local"}
 
 
 @app.get("/api/download")
