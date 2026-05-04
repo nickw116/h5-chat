@@ -10,10 +10,11 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Query, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from . import config
@@ -27,17 +28,32 @@ logger = logging.getLogger("bridge")
 
 # ── 文件路径检测（用于自动上传 agent 生成的文件）───────────────────
 # 匹配常见文件路径 + 扩展名（PPT, PDF, Word, Excel, 图片, 压缩包, 文本等）
+# 使用非路径字符作为前后边界，能匹配中文、标点、括号等后面的本地路径
 _FILE_EXT_PATTERN = re.compile(
-    r'(?:^|[\s\'\"\(\[\{,;])'
-    r'((?:/root/|/tmp/|/home/|/var/|\.\./|\./)\S+\.'
-    r'(?:pptx?|xlsx?|docx?|pdf|png|jpe?g|gif|svg|zip|rar|7z|tar\.gz|txt|csv|json|md|py|js|html?|css)'
-    r')'
-    r'(?:$|[\s\'\"\)\]\},;.])',
+    r'(?:^|(?<![\w/.\-]))'
+    r'((?:/root/|/tmp/|/home/|/var/|\.\./|\./)[\w/.\-]+\.'
+    r'(?:pptx?|xlsx?|docx?|pdf|png|jpe?g|gif|svg|zip|rar|7z|tar\.gz|txt|csv|json|md|py|js|html?|css))'
+    r'(?:$|(?![\w/.\-]))',
     re.IGNORECASE
 )
 
 # 去重：同一个文件只上传一次（按 run 的生命周期）
 _uploaded_files_cache: set[str] = set()
+
+# 已上传文件的本地路径 → COS URL 映射（用于跨 delta 文本替换）
+_uploaded_file_url_map: dict[str, str] = {}
+
+
+def _replace_uploaded_paths(text: str) -> str:
+    """将文本中所有已上传的本地路径替换为对应的 COS URL。"""
+    if not _uploaded_file_url_map:
+        return text
+    for match in _FILE_EXT_PATTERN.finditer(text):
+        path = match.group(1).rstrip('.,;:!?)')
+        url = _uploaded_file_url_map.get(path)
+        if url:
+            text = text.replace(path, url)
+    return text
 _FILTERED_STREAM_TEXTS = {"NO_REPLY", "HEARTBEAT_OK"}
 
 # H5 前端不显示主 agent (dev) 的工具调用卡片
@@ -60,11 +76,11 @@ _H5_FILTERED_MAIN_AGENT_TOOLS = frozenset({
 })
 
 _ACP_FORCE_PATTERNS = [
-    r'\b(?:acp|claude code|cursor|copilot|gemini(?:\s+cli)?|qwen|kiro|kimi|opencode)\b',
-    r'用(?:acp|claude code|cursor|copilot|gemini|qwen|kiro|kimi)',
-    r'交给(?:acp|子代理|子 ?agent|编码代理)',
+    r'\b(?:acp|claude|claude code|cursor|copilot|gemini(?: +cli)?|qwen|kiro|kimi|opencode)\b',
+    r'用(?:acp|claude|claude code|cursor|copilot|gemini|qwen|kiro|kimi)',
+    r'交给(?:acp|claude|子代理|子 ?agent|编码代理)',
     r'(?:走|开启|切到|进入)(?:acp|编码模式|子代理)',
-    r'直接用(?:acp|子代理)',
+    r'直接用(?:acp|claude|子代理)',
 ]
 
 _ACP_SOFT_PATTERNS = [
@@ -169,7 +185,7 @@ _child_to_parent: dict[str, str] = {}  # child sessionKey → parent sessionKey 
 _acp_run_cwd: dict[str, str] = {}  # runId → cwd (for claude:acp runs, to find CC project log)
 _agent_listener_registered = False
 _active_acp_runs: dict[str, dict] = {}  # runId -> {runId, status, started_at}
-_EVENT_STREAM_HEARTBEAT_SEC = 15
+_EVENT_STREAM_HEARTBEAT_SEC = 8
 
 # 运行时模型缓存：sessionKey → model（由 /model 命令或 SSE agent 事件更新）
 _session_runtime_model: dict[str, str] = {}
@@ -179,7 +195,7 @@ _run_cache: dict[str, dict] = {}
 _child_events_cache: dict[str, list] = {}  # parent sessionKey → cached child events
 _child_events_cache_created_at: dict[str, float] = {}  # parent sessionKey → first cached timestamp
 _child_event_seq = 0
-_RUN_CACHE_MAX_AGE = 600  # 缓存保留 10 分钟
+_RUN_CACHE_MAX_AGE = 1800  # 缓存保留 30 分钟
 
 
 def _cache_child_event(parent_sk: str, payload: dict):
@@ -221,7 +237,7 @@ def _public_child_event(ev: dict) -> dict:
 def _cleanup_old_cache():
     """清理过期缓存"""
     now = time.time()
-    expired = [rid for rid, v in _run_cache.items() if now - v["created_at"] > _RUN_CACHE_MAX_AGE]
+    expired = [rid for rid, v in _run_cache.items() if now - v.get("last_event_at", v["created_at"]) > _RUN_CACHE_MAX_AGE]
     for rid in expired:
         _run_cache.pop(rid, None)
         _run_to_parent_session.pop(rid, None)
@@ -239,10 +255,10 @@ def _cleanup_old_cache():
     if expired_parent_keys:
         logger.info("Cleaned up %d expired child event cache entries", len(expired_parent_keys))
 
-    # 清理无活动的 _active_acp_runs（超过10分钟无事件且仍在 running 的残留）
+    # 清理无活动的 _active_acp_runs（超过5分钟无事件且仍在 running 的残留）
     expired_acp = [
         rid for rid, info in list(_active_acp_runs.items())
-        if info.get("status") == "running" and now - info.get("last_event_at", info.get("started_at", 0)) > 600
+        if info.get("status") == "running" and now - info.get("last_event_at", info.get("started_at", 0)) > 300
     ]
     for rid in expired_acp:
         _active_acp_runs[rid]["status"] = "timeout"
@@ -264,7 +280,17 @@ def _cleanup_old_cache():
 
 def _register_session_subscriber(session_key: str, subscriber_id: str) -> asyncio.Queue:
     queue: asyncio.Queue = asyncio.Queue()
-    _session_event_subscribers.setdefault(session_key, {})[subscriber_id] = queue
+    # Deduplication: only one active subscriber per sessionKey.
+    # Remove and drain any existing subscribers so events don't accumulate.
+    existing = _session_event_subscribers.pop(session_key, {})
+    if existing:
+        for old_id, old_queue in existing.items():
+            while not old_queue.empty():
+                try:
+                    old_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+    _session_event_subscribers[session_key] = {subscriber_id: queue}
     logger.info("Registered event subscriber: sessionKey=%s subscriber=%s total=%d", session_key[:30], subscriber_id[:8], len(_session_event_subscribers.get(session_key, {})))
     return queue
 
@@ -280,9 +306,16 @@ def _unregister_session_subscriber(session_key: str, subscriber_id: str):
 
 
 def _publish_acp_status():
-    """推送当前 ACP 状态到所有活跃的 event subscriber"""
+    """推送当前 ACP 状态到所有活跃的 event subscriber（内部先清理超2分钟无事件的残留）"""
+    now = time.time()
+    for rid, info in list(_active_acp_runs.items()):
+        if info.get("status") == "running" and now - info.get("last_event_at", info.get("started_at", 0)) > 120:
+            _active_acp_runs[rid]["status"] = "timeout"
     runs = []
     for rid, info in list(_active_acp_runs.items()):
+        # 只推送真正在 running 的 run，已完成/超时的由延迟清理任务处理
+        if info.get("status") != "running":
+            continue
         run_data = {"runId": rid, "status": info.get("status", "running")}
         steps = info.get("steps", [])
         if steps:
@@ -403,6 +436,25 @@ async def _publish_full_result_from_history(session_key: str, run_id: str, clien
             logger.info("_publish_full_result_from_history: no assistant text found for session=%s run=%s", session_key[:30], run_id[:12])
             return
 
+        # Replace local file paths with COS URLs in the full text
+        for fpath in _extract_file_paths(full_text):
+            if fpath not in _uploaded_file_url_map:
+                file_info = await asyncio.to_thread(cos_util.upload_local_file, fpath)
+                if file_info:
+                    _uploaded_file_url_map[fpath] = file_info["url"]
+                    logger.info("[COS] Auto-uploaded agent file (full_result): %s -> %s", fpath, file_info["url"])
+                    # Push file event
+                    await _publish_session_event(session_key, {
+                        "eventId": f"evt-{uuid.uuid4().hex[:16]}",
+                        "sessionKey": session_key,
+                        "runId": run_id,
+                        "source": "main",
+                        "ts": int(time.time() * 1000),
+                        "kind": "media.file",
+                        "payload": {"file": file_info},
+                    })
+        full_text = _replace_uploaded_paths(full_text)
+
         await _publish_session_event(session_key, {
             "eventId": f"evt-{uuid.uuid4().hex[:16]}",
             "sessionKey": session_key,
@@ -425,9 +477,34 @@ async def _publish_full_result_from_history(session_key: str, run_id: str, clien
         cache = _run_cache.get(run_id)
         if cache:
             cache["status"] = "done"
+            cache["last_event_at"] = time.time()
     except Exception as e:
         logger.warning("_publish_full_result_from_history failed: %s", e)
 
+
+# Buffer for accumulating assistant deltas per run (for cross-delta file path detection)
+_assistant_delta_buffer: dict[str, str] = {}  # run_id -> accumulated text
+
+async def _flush_file_paths_for_run(session_key: str, run_id: str, source: str, base_template: dict):
+    """Scan accumulated assistant text for local file paths, upload to COS, push file events."""
+    buffer_key = run_id
+    accumulated = _assistant_delta_buffer.pop(buffer_key, "")
+    if not accumulated:
+        return
+    # Detect file paths in the full accumulated text
+    file_paths = _extract_file_paths(accumulated)
+    if not file_paths:
+        return
+    logger.info("[COS] Found %d file paths in accumulated assistant text for run=%s", len(file_paths), run_id[:12])
+    for fpath in file_paths:
+        file_info = await asyncio.to_thread(cos_util.upload_local_file, fpath)
+        if file_info:
+            _uploaded_file_url_map[fpath] = file_info["url"]
+            logger.info("[COS] Auto-uploaded agent file (persistent flush): %s -> %s", fpath, file_info["url"])
+            # Push file event to frontend
+            file_event_id = f"evt-{uuid.uuid4().hex[:16]}"
+            file_base = {**base_template, "eventId": file_event_id}
+            await _publish_session_event(session_key, {**file_base, "kind": "media.file", "payload": {"file": file_info}})
 
 async def _publish_gateway_event(session_key: str, run_id: str, stream: str, payload: dict):
     """Convert raw Gateway agent event into a rich event and publish to persistent subscribers."""
@@ -443,7 +520,21 @@ async def _publish_gateway_event(session_key: str, run_id: str, stream: str, pay
     base = {"eventId": event_id, "sessionKey": session_key, "runId": run_id, "source": source, "ts": ts}
 
     if stream == "assistant":
-        event = {**base, "kind": "assistant.delta", "payload": {"delta": data.get("delta", ""), **child_fields}}
+        delta_text = data.get("delta", "")
+        # Accumulate delta text for cross-fragment file path detection
+        buffer_key = run_id
+        _assistant_delta_buffer[buffer_key] = _assistant_delta_buffer.get(buffer_key, "") + delta_text
+        # Also try immediate detection (for paths that arrive intact in a single delta)
+        for fpath in _extract_file_paths(delta_text):
+            file_info = await asyncio.to_thread(cos_util.upload_local_file, fpath)
+            if file_info:
+                _uploaded_file_url_map[fpath] = file_info["url"]
+                logger.info("[COS] Auto-uploaded agent file (persistent immediate): %s -> %s", fpath, file_info["url"])
+                file_event_id = f"evt-{uuid.uuid4().hex[:16]}"
+                file_base = {**base, "eventId": file_event_id}
+                await _publish_session_event(session_key, {**file_base, "kind": "media.file", "payload": {"file": file_info}})
+        delta_text = _replace_uploaded_paths(delta_text)
+        event = {**base, "kind": "assistant.delta", "payload": {"delta": delta_text, **child_fields}}
     elif stream == "item":
         phase = data.get("phase", "")
         kind_map = {"start": "item.started", "update": "item.updated", "end": "item.completed"}
@@ -464,6 +555,8 @@ async def _publish_gateway_event(session_key: str, run_id: str, stream: str, pay
                 run_error_event = {**base, "kind": "run_error", "payload": {"error": error_text, "phase": phase}}
                 await _publish_session_event(session_key, run_error_event)
         if phase == "end":
+            # Flush accumulated assistant text for file path detection
+            asyncio.create_task(_flush_file_paths_for_run(session_key, run_id, source, base))
             # After lifecycle end, pull full text from history and publish full_result
             asyncio.create_task(_publish_full_result_from_history(session_key, run_id))
     elif stream == "plan":
@@ -996,20 +1089,18 @@ def _register_global_agent_listener(client):
                         asyncio.create_task(_stream_cc_log(session_key, run_id, parent_sk))
                         logger.info("Started CC log streaming: runId=%s parent=%s", run_id[:12], parent_sk[:30])
             elif phase == "end" and run_id in _active_acp_runs:
-                # Push Claude Code project log events BEFORE marking done
-                # so they arrive while frontend ACP card is still "running"
+                # Mark done immediately so run lifecycle is not blocked by project event push
+                _active_acp_runs[run_id]["status"] = "done"
+                _publish_acp_status()
                 if "claude:acp" in session_key or "acp" in session_key:
+                    # Push CC project log events in background; do not block done marking
                     asyncio.create_task(_push_cc_project_events(session_key, run_id))
-                else:
-                    # Non-CC ACP: mark done immediately
-                    _active_acp_runs[run_id]["status"] = "done"
+                async def _delayed_acp_cleanup(rid=run_id):
+                    await asyncio.sleep(5)
+                    _active_acp_runs.pop(rid, None)
+                    _acp_run_cwd.pop(rid, None)
                     _publish_acp_status()
-                    async def _delayed_acp_cleanup(rid=run_id):
-                        await asyncio.sleep(5)
-                        _active_acp_runs.pop(rid, None)
-                        _acp_run_cwd.pop(rid, None)
-                        _publish_acp_status()
-                    asyncio.create_task(_delayed_acp_cleanup())
+                asyncio.create_task(_delayed_acp_cleanup())
                 logger.info("Marked ACP run done from global listener: runId=%s", run_id[:12])
 
         # 用 sessionKey 匹配活跃 queue
@@ -1060,6 +1151,7 @@ def _register_global_agent_listener(client):
         cache = _run_cache.get(chat_run_id) or _run_cache.get(run_id)
         if cache:
             cache["events"].append(payload)
+            cache["last_event_at"] = time.time()
             data = payload.get("data", {})
             if stream == "lifecycle" and data.get("phase") == "end":
                 cache["status"] = "done"
@@ -1142,6 +1234,11 @@ class ChangePasswordReq(BaseModel):
     new_password: str
 
 
+class SwitchModelReq(BaseModel):
+    model: str
+    session_key: str | None = None
+
+
 # ── Routes ──────────────────────────────────────────────────────
 
 async def _build_session_snapshot(session_key: str) -> dict:
@@ -1178,13 +1275,15 @@ async def _build_session_snapshot(session_key: str) -> dict:
                     if name and phase in ("start", "end"):
                         steps.append({"name": name, "phase": phase, "summary": summary})
 
-            snapshot["activeRuns"][active_run_id] = {
-                "status": cache.get("status", "streaming"),
-                "mainText": main_text,
-                "acpText": acp_text,
-                "steps": steps[-20:],  # last 20 steps
-                "createdAt": cache.get("created_at", 0),
-            }
+            run_status = cache.get("status", "streaming")
+            if run_status not in ("done", "error", "timeout"):
+                snapshot["activeRuns"][active_run_id] = {
+                    "status": run_status,
+                    "mainText": main_text,
+                    "acpText": acp_text,
+                    "steps": steps[-20:],  # last 20 steps
+                    "createdAt": cache.get("created_at", 0),
+                }
     else:
         # No active run — check if there's a recent run in cache
         for rid, psk in list(_run_to_parent_session.items()):
@@ -1246,7 +1345,7 @@ async def event_stream(
             now = time.time()
             stale_rids = []
             for rid, info in list(_active_acp_runs.items()):
-                if info.get("status") == "running" and now - info.get("last_event_at", info.get("started_at", 0)) > 600:
+                if info.get("status") == "running" and now - info.get("last_event_at", info.get("started_at", 0)) > 300:
                     _active_acp_runs[rid]["status"] = "timeout"
                     stale_rids.append(rid)
             if stale_rids:
@@ -1261,7 +1360,7 @@ async def event_stream(
                 asyncio.create_task(_snapshot_delayed_cleanup(stale_rids))
             acp_runs = []
             for rid, info in list(_active_acp_runs.items()):
-                if info.get("status") == "timeout":
+                if info.get("status") in ("timeout", "done"):
                     continue
                 acp_runs.append({"runId": rid, "status": info.get("status", "running")})
             acp_status_event = {
@@ -1274,12 +1373,18 @@ async def event_stream(
             yield f"data: {json.dumps(acp_status_event, ensure_ascii=False)}\n\n"
             logger.info("Event stream opened: sessionKey=%s subscriber=%s snapshot_runs=%d", sessionKey[:30], subscriber_id[:8], len(snapshot.get("activeRuns", {})))
 
+            last_heartbeat = time.time()
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=_EVENT_STREAM_HEARTBEAT_SEC)
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    last_heartbeat = time.time()
                 except asyncio.TimeoutError:
-                    yield f"event: ping\ndata: {{\"ts\": {int(time.time() * 1000)}}}\n\n"
+                    # 只在有活跃 run 时发 SSE 注释心跳，防止工具调用期间空闲超时
+                    active_run = _agent_session_to_run.get(sessionKey)
+                    if active_run and time.time() - last_heartbeat > _EVENT_STREAM_HEARTBEAT_SEC:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = time.time()
         except asyncio.CancelledError:
             logger.info("Event stream cancelled: sessionKey=%s subscriber=%s", sessionKey[:30], subscriber_id[:8])
         except Exception as e:
@@ -1545,6 +1650,39 @@ async def models(sessionKey: str = Query(None), user=Depends(get_current_user)):
     return payload
 
 
+@app.post("/api/model/switch")
+async def switch_model(req: SwitchModelReq, user=Depends(get_current_user)):
+    """Switch the active model for the current session.
+
+    Updates the runtime model cache and notifies Gateway via /model command.
+    """
+    client = await get_client()
+    agent_id = _agent_id(user['role'])
+    session_key = req.session_key or users.get_or_create_session(user['id'], agent_id)
+    users.touch_session(user['id'], agent_id, session_key)
+
+    target_model = req.model.strip()
+    normalized = _normalize_model_name(target_model)
+    if not normalized:
+        raise HTTPException(400, "Invalid model name")
+
+    # Update runtime cache immediately so /api/models reflects the change
+    _session_runtime_model[session_key] = normalized
+
+    # Send /model command to Gateway so subsequent chat uses the new model
+    send_res = await client.rpc("chat.send", {
+        "sessionKey": session_key,
+        "message": f"/model {target_model}",
+        "idempotencyKey": str(uuid.uuid4()),
+    })
+    if not send_res.get("ok"):
+        logger.warning("model switch chat.send failed: %s", send_res.get("error"))
+        # Don't raise here — local cache is already updated, Gateway may recover
+
+    logger.info("Model switch: sessionKey=%s → %s", session_key[:30], normalized)
+    return {"model": normalized, "sessionKey": session_key}
+
+
 @app.get("/api/history")
 async def history(
     limit: int = Query(50),
@@ -1611,12 +1749,14 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
     _cleanup_old_cache()
     # 清理文件上传缓存（每个 run 重新检测）
     _uploaded_files_cache.clear()
+    _uploaded_file_url_map.clear()
 
     # 注册消息缓存（用 chat.send 返回的 runId）
     _run_cache[run_id] = {
         "events": [],
         "status": "streaming",
         "created_at": time.time(),
+        "last_event_at": time.time(),
     }
     _run_to_parent_session[run_id] = session_key
 
@@ -1819,15 +1959,16 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
                                 buffering_assistant_text = False
                                 pushed_valid_text = True
                                 logger.info("SSE assistant buffer released: buffer=%s", repr(assistant_buffer[:50]))
-                                yield f"data: {json.dumps({'type': 'text', 'content': assistant_buffer, 'source': source, 'childEventId': event.get('_child_event_id') if is_child else None}, ensure_ascii=False)}\n\n"
-
-                                # 检测本地文件路径，自动上传到 COS 并推送文件事件
+                                # 检测本地文件路径，上传 COS 并替换为公网 URL，同时推送 file event
                                 for fpath in _extract_file_paths(assistant_buffer):
                                     file_info = cos_util.upload_local_file(fpath)
                                     if file_info:
+                                        _uploaded_file_url_map[fpath] = file_info["url"]
                                         logger.info("[COS] Auto-uploaded agent file: %s -> %s", fpath, file_info["url"])
                                         yield f"data: {json.dumps({'type': 'file', 'file': file_info}, ensure_ascii=False)}\n\n"
 
+                                assistant_buffer = _replace_uploaded_paths(assistant_buffer)
+                                yield f"data: {json.dumps({'type': 'text', 'content': assistant_buffer, 'source': source, 'childEventId': event.get('_child_event_id') if is_child else None}, ensure_ascii=False)}\n\n"
                                 assistant_buffer = ""
                         else:
                             assistant_buffer = ""
@@ -1841,14 +1982,16 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
                     logger.info("SSE assistant delta=%s, data keys=%s, post-lifecycle=%s", repr(delta[:50]) if delta else 'EMPTY', list(data.keys()), lifecycle_ended)
                     if delta and not should_skip_delta and not buffering_assistant_text:
                         pushed_valid_text = True
-                        yield f"data: {json.dumps({'type': 'text', 'content': delta, 'source': source, 'childEventId': event.get('_child_event_id') if is_child else None}, ensure_ascii=False)}\n\n"
-
-                        # 检测本地文件路径，自动上传到 COS 并推送文件事件
+                        # 检测本地文件路径，上传 COS 并替换为公网 URL，同时推送 file event
                         for fpath in _extract_file_paths(delta):
                             file_info = cos_util.upload_local_file(fpath)
                             if file_info:
+                                _uploaded_file_url_map[fpath] = file_info["url"]
                                 logger.info("[COS] Auto-uploaded agent file: %s -> %s", fpath, file_info["url"])
                                 yield f"data: {json.dumps({'type': 'file', 'file': file_info}, ensure_ascii=False)}\n\n"
+
+                        delta = _replace_uploaded_paths(delta)
+                        yield f"data: {json.dumps({'type': 'text', 'content': delta, 'source': source, 'childEventId': event.get('_child_event_id') if is_child else None}, ensure_ascii=False)}\n\n"
 
                     if lifecycle_ended and has_spawned_subagent and not _announce_status_sent[0]:
                         # lifecycle end 之后的 assistant 事件，说明是 spawn 子 agent 完成后的后续回复
@@ -1881,17 +2024,8 @@ async def chat_send_legacy(req: ChatReq, user=Depends(get_current_user)):
                     if item_name == "sessions_spawn" or "spawn" in item_name.lower():
                         has_spawned_subagent = True
                         logger.info("SSE detected sub-agent spawn. sessionKey=%s", session_key)
-                        # 注册 ACP run 到状态追踪
-                        _run_id_for_acp = _agent_session_to_run.get(session_key)
-                        if _run_id_for_acp and _run_id_for_acp not in _active_acp_runs:
-                            now = time.time()
-                            _active_acp_runs[_run_id_for_acp] = {
-                                "runId": _run_id_for_acp,
-                                "status": "running",
-                                "started_at": now,
-                                "last_event_at": now,
-                            }
-                            _publish_acp_status()
+                        # 注：ACP run 的注册由 global agent listener（子 agent lifecycle start）统一处理，
+                        # 这里不再重复注册，避免同一任务因父/子 runId 不同而被计数两次。
 
                     if item_kind == "tool":
                         if item_phase == "start":
@@ -2103,8 +2237,9 @@ async def chat_send(req: ChatReq, request: Request, user=Depends(get_current_use
 
     _cleanup_old_cache()
     _uploaded_files_cache.clear()
+    _uploaded_file_url_map.clear()
 
-    _run_cache[run_id] = {"events": [], "status": "streaming", "created_at": time.time()}
+    _run_cache[run_id] = {"events": [], "status": "streaming", "created_at": time.time(), "last_event_at": time.time()}
     _run_to_parent_session[run_id] = session_key
     _agent_session_to_run[session_key] = run_id
 
@@ -2338,6 +2473,51 @@ async def download_file(
         resp.iter_content(chunk_size=65536),
         headers=headers,
     )
+
+
+@app.get("/api/local-file")
+async def serve_local_file(
+    path: str = Query(..., description="Local file path"),
+    token: str = Query(default="", description="Auth token for img src"),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Serve local files for H5 preview (images and PDFs only).
+    Supports Bearer header (normal API) or ?token= query param (img src)."""
+    import mimetypes
+
+    # Authenticate via header or query param (img tags can't send custom headers)
+    auth_token = ""
+    if authorization and authorization.startswith("Bearer "):
+        auth_token = authorization[7:]
+    elif token:
+        auth_token = token
+
+    if not auth_token:
+        raise HTTPException(401, "Missing token")
+
+    user = users.verify_token(auth_token)
+    if not user:
+        raise HTTPException(401, "Invalid token")
+
+    # 安全检查：只允许特定目录
+    allowed_dirs = ("/tmp/", "/root/", "/home/", "/var/www/")
+    if not any(path.startswith(d) for d in allowed_dirs):
+        raise HTTPException(403, "Access denied")
+
+    # 只允许图片和 PDF
+    allowed_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".pdf"}
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in allowed_exts:
+        raise HTTPException(403, "File type not allowed")
+
+    if not os.path.isfile(path):
+        raise HTTPException(404, "File not found")
+
+    content_type, _ = mimetypes.guess_type(path)
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    return FileResponse(path, media_type=content_type)
 
 
 # ── ACP Agent Log Streaming ─────────────────────────────────────
