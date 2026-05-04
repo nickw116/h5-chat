@@ -12,3 +12,4 @@ venv/
 *.secret
 credentials.*
 config.local.*
+tests/.venv/
