@@ -13,3 +13,4 @@ venv/
 credentials.*
 config.local.*
 tests/.venv/
+tests/.venv/

@@ -8,7 +8,10 @@ from datetime import datetime
 
 from qcloud_cos import CosConfig, CosS3Client
 
-from . import cos_config as cfg
+try:
+    from . import cos_config as cfg
+except ImportError:
+    import cos_config as cfg
 
 logger = logging.getLogger("bridge")
 

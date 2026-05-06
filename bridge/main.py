@@ -1,6 +1,7 @@
 """FastAPI bridge: H5 frontend ↔ OpenClaw Gateway WebSocket RPC."""
 
 import asyncio
+import collections
 import glob
 import json
 import os
@@ -9,7 +10,7 @@ import uuid
 import logging
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Query, UploadFile, File, Request
@@ -197,6 +198,12 @@ _child_events_cache_created_at: dict[str, float] = {}  # parent sessionKey → f
 _child_event_seq = 0
 _RUN_CACHE_MAX_AGE = 1800  # 缓存保留 30 分钟
 
+_SESSION_EVENT_BUFFER_MAX = 1000
+_SESSION_EVENT_BUFFER_MAX_AGE = 1800
+_session_event_buffers: dict[str, collections.deque] = {}  # sessionKey -> deque of {seq, eventId, event, ts}
+_session_event_seqs: dict[str, int] = {}  # sessionKey -> next sequence number
+_session_ack_seqs: dict[str, int] = {}  # sessionKey -> highest acked seq
+
 
 def _cache_child_event(parent_sk: str, payload: dict):
     """Append a child-agent event to the parent session cache used by /child-events."""
@@ -277,6 +284,63 @@ def _cleanup_old_cache():
         logger.info("Cleaned up %d timed-out acp runs", len(timed_out))
         _publish_acp_status()
 
+    # 清理过期的 session event buffer 和无 subscriber 的 seq 计数器
+    expired_buffers = [
+        sk for sk, buf in list(_session_event_buffers.items())
+        if not buf or (buf and now - buf[0]["ts"] > _SESSION_EVENT_BUFFER_MAX_AGE)
+    ]
+    for sk in expired_buffers:
+        _session_event_buffers.pop(sk, None)
+        _session_event_seqs.pop(sk, None)
+        _session_ack_seqs.pop(sk, None)
+    if expired_buffers:
+        logger.info("Cleaned up %d expired session event buffers", len(expired_buffers))
+
+
+def _session_short(session_key: str) -> str:
+    return session_key[:6] if len(session_key) >= 6 else session_key
+
+
+def _generate_event_id(session_key: str) -> tuple[str, int]:
+    """Generate sequential event ID. Returns (eventId, seq)."""
+    seq = _session_event_seqs.get(session_key, 0) + 1
+    _session_event_seqs[session_key] = seq
+    short = _session_short(session_key)
+    return f"evt-{short}-{seq:06d}", seq
+
+
+def _buffer_session_event(session_key: str, event: dict, seq: int):
+    """Append event to per-session ring buffer."""
+    buf = _session_event_buffers.setdefault(session_key, collections.deque(maxlen=_SESSION_EVENT_BUFFER_MAX))
+    buf.append({"seq": seq, "eventId": event.get("eventId"), "event": event, "ts": time.time()})
+
+
+def _trim_acked_events(session_key: str):
+    """Remove events with seq <= ack_seq from buffer."""
+    ack_seq = _session_ack_seqs.get(session_key, 0)
+    buf = _session_event_buffers.get(session_key)
+    if not buf:
+        return
+    while buf and buf[0]["seq"] <= ack_seq:
+        buf.popleft()
+
+
+def _get_replay_events(session_key: str, last_event_id: str | None) -> list[dict]:
+    """Return buffered events with seq > last_event_id."""
+    if not last_event_id or not last_event_id.startswith("evt-"):
+        return []
+    parts = last_event_id.rsplit("-", 1)
+    if len(parts) != 2:
+        return []
+    try:
+        last_seq = int(parts[1])
+    except ValueError:
+        return []
+    buf = _session_event_buffers.get(session_key)
+    if not buf:
+        return []
+    return [entry["event"] for entry in buf if entry["seq"] > last_seq]
+
 
 def _register_session_subscriber(session_key: str, subscriber_id: str) -> asyncio.Queue:
     queue: asyncio.Queue = asyncio.Queue()
@@ -339,6 +403,11 @@ def _publish_acp_status():
 async def _publish_session_event(session_key: str, event: dict):
     if not session_key:
         return
+    # Generate sequential event ID and buffer before queuing to subscribers
+    event_id, seq = _generate_event_id(session_key)
+    event["eventId"] = event_id
+    _buffer_session_event(session_key, event, seq)
+
     # Try both the full session key and the public (un-prefixed) key,
     # because /api/events registers subscribers with bare keys while
     # _publish_gateway_event may publish with agent-prefixed keys.
@@ -1239,6 +1308,11 @@ class SwitchModelReq(BaseModel):
     session_key: str | None = None
 
 
+class AckReq(BaseModel):
+    sessionKey: str
+    eventId: str
+
+
 # ── Routes ──────────────────────────────────────────────────────
 
 async def _build_session_snapshot(session_key: str) -> dict:
@@ -1312,6 +1386,7 @@ async def _build_session_snapshot(session_key: str) -> dict:
 async def event_stream(
     sessionKey: str = Query(None),
     clientId: str = Query(None),
+    lastEventId: str = Query(None),
     user=Depends(get_current_user),
 ):
     """Persistent SSE event stream.
@@ -1373,7 +1448,13 @@ async def event_stream(
             yield f"data: {json.dumps(acp_status_event, ensure_ascii=False)}\n\n"
             logger.info("Event stream opened: sessionKey=%s subscriber=%s snapshot_runs=%d", sessionKey[:30], subscriber_id[:8], len(snapshot.get("activeRuns", {})))
 
+            # Replay buffered events that were sent after lastEventId
+            replay_events = _get_replay_events(sessionKey, lastEventId)
+            for revt in replay_events:
+                yield f"data: {json.dumps(revt, ensure_ascii=False)}\n\n"
+
             last_heartbeat = time.time()
+            last_trim = time.time()
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=1.0)
@@ -1385,6 +1466,10 @@ async def event_stream(
                     if active_run and time.time() - last_heartbeat > _EVENT_STREAM_HEARTBEAT_SEC:
                         yield ": heartbeat\n\n"
                         last_heartbeat = time.time()
+                    # 定期清理已 ACK 的事件
+                    if time.time() - last_trim > 30:
+                        _trim_acked_events(sessionKey)
+                        last_trim = time.time()
         except asyncio.CancelledError:
             logger.info("Event stream cancelled: sessionKey=%s subscriber=%s", sessionKey[:30], subscriber_id[:8])
         except Exception as e:
@@ -1401,6 +1486,24 @@ async def event_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/api/events/ack")
+async def ack_event(req: AckReq, user=Depends(get_current_user)):
+    """Advance ACK watermark for session."""
+    session_key = req.sessionKey
+    event_id = req.eventId
+    if not session_key or not event_id:
+        raise HTTPException(400, "sessionKey and eventId required")
+    if not event_id.startswith("evt-"):
+        raise HTTPException(400, "invalid eventId format")
+    parts = event_id.rsplit("-", 1)
+    seq = int(parts[1])
+    current = _session_ack_seqs.get(session_key, 0)
+    if seq > current:
+        _session_ack_seqs[session_key] = seq
+        _trim_acked_events(session_key)
+    return {"ok": True, "ackedSeq": seq}
 
 
 @app.get("/api/health")
@@ -2974,4 +3077,132 @@ async def acp_log_stream(
     )
 
 
+# ── 股票K线数据 ─────────────────────────────────────────────────
+
+@app.get("/api/stock/kline")
+async def stock_kline(
+    symbol: str = Query(...),
+    full_history: bool = Query(False),
+):
+    """获取股票K线数据，返回 JSON。使用 baostock 数据源。"""
+    import pandas as pd
+    import baostock as bs
+
+    def _normalize_symbol(s: str):
+        s = s.strip().lower()
+        if s.startswith("sh"):
+            return s, "sh"
+        if s.startswith("sz"):
+            return s, "sz"
+        if len(s) == 6:
+            if s.startswith("6"):
+                return f"sh.{s}", "sh"
+            return f"sz.{s}", "sz"
+        return s, "sh"
+
+    def _calc_ma(df: pd.DataFrame, periods=(5, 10, 20)):
+        df = df.copy()
+        for p in periods:
+            df[f"ma{p}"] = df["close"].rolling(window=p).mean()
+        return df
+
+    def _calc_macd(df: pd.DataFrame, fast=12, slow=26, signal=9):
+        df = df.copy()
+        ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
+        ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
+        df["dif"] = ema_fast - ema_slow
+        df["dea"] = df["dif"].ewm(span=signal, adjust=False).mean()
+        df["hist"] = 2 * (df["dif"] - df["dea"])
+        return df
+
+    ba_symbol, market = _normalize_symbol(symbol)
+    code = ba_symbol.replace("sh.", "").replace("sz.", "")
+
+    end_date = datetime.now()
+    if full_history:
+        start_date = datetime(1990, 1, 1)
+    else:
+        start_date = end_date - timedelta(days=int(60 * 1.8))
+
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise HTTPException(500, f"baostock 登录失败: {lg.error_msg}")
+
+    try:
+        rs = bs.query_history_k_data_plus(
+            ba_symbol,
+            "date,open,high,low,close,volume",
+            start_date=start_str,
+            end_date=end_str,
+            frequency="d",
+            adjustflag="2",
+        )
+        if rs.error_code != "0":
+            raise HTTPException(500, f"baostock 查询失败: {rs.error_msg}")
+
+        data = []
+        while rs.next():
+            data.append(rs.get_row_data())
+
+        if not data:
+            raise HTTPException(500, "未获取到数据")
+
+        df = pd.DataFrame(data, columns=["date", "open", "high", "low", "close", "volume"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        df = df.sort_values("date").reset_index(drop=True)
+
+        if not full_history and len(df) > 60:
+            df = df.tail(60).reset_index(drop=True)
+
+        df = _calc_macd(df)
+        df = _calc_ma(df)
+    finally:
+        bs.logout()
+
+    kline = []
+    for _, row in df.iterrows():
+        item = {
+            "date": str(row["date"].date()),
+            "open": round(float(row["open"]), 2),
+            "high": round(float(row["high"]), 2),
+            "low": round(float(row["low"]), 2),
+            "close": round(float(row["close"]), 2),
+            "volume": int(row["volume"]) if "volume" in row and pd.notna(row["volume"]) else 0,
+        }
+        if "ma5" in row and pd.notna(row["ma5"]):
+            item["ma5"] = round(float(row["ma5"]), 2)
+        if "ma10" in row and pd.notna(row["ma10"]):
+            item["ma10"] = round(float(row["ma10"]), 2)
+        if "ma20" in row and pd.notna(row["ma20"]):
+            item["ma20"] = round(float(row["ma20"]), 2)
+        kline.append(item)
+
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else latest
+    current_price = float(latest["close"])
+    prev_close = float(prev["close"])
+    change_pct = round((current_price / prev_close - 1) * 100, 2) if prev_close > 0 else 0.0
+
+    return {
+        "code": 0,
+        "data": {
+            "kline": kline,
+            "meta": {
+                "symbol": symbol,
+                "code": code,
+                "market": market,
+                "name": symbol,
+                "current_price": round(current_price, 2),
+                "change_pct": change_pct,
+                "count": len(kline),
+                "date_range": f"{kline[0]['date']} ~ {kline[-1]['date']}" if kline else "",
+            }
+        }
+    }
 
